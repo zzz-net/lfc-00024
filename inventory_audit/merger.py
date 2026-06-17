@@ -75,19 +75,27 @@ def get_merge_summary(db_path: str) -> Dict[str, Any]:
     return summary
 
 
-def remerge_all(db_path: str, default_status: str = "pending") -> Dict[str, Any]:
+def remerge_all(
+    db_path: str,
+    default_status: str = "pending",
+    merge_keys: List[str] = None,
+) -> Dict[str, Any]:
     """重新计算所有差异（用于数据修复）.
 
     遍历所有来源行，重新计算差异总量和关联关系。
-    不会改变已有的状态和备注。
+    不会改变已有的状态和备注。合并键由 rules.merge_keys 驱动。
 
     Args:
         db_path: 数据库路径
         default_status: 新增差异的默认状态
+        merge_keys: 合并键字段名列表
 
     Returns:
         重建结果统计
     """
+    if merge_keys is None:
+        merge_keys = ["location", "sku"]
+
     with db.get_conn(db_path) as conn:
         source_rows = conn.execute(
             """SELECT sl.*, b.batch_name
@@ -100,29 +108,36 @@ def remerge_all(db_path: str, default_status: str = "pending") -> Dict[str, Any]
         source_links: Dict[str, List[int]] = {}
 
         for row in source_rows:
-            key = f"{row['location']}|{row['sku']}"
+            row_dict = dict(row)
+            key = "|".join(str(row_dict.get(k, "")) for k in merge_keys)
             if key not in diff_map:
                 diff_map[key] = {
-                    "location": row["location"],
-                    "sku": row["sku"],
+                    "location": row_dict["location"],
+                    "sku": row_dict["sku"],
+                    "merge_key": key,
                     "total_diff_qty": 0,
                 }
                 source_links[key] = []
-            diff_map[key]["total_diff_qty"] += row["diff_qty"]
-            source_links[key].append(row["id"])
+            diff_map[key]["total_diff_qty"] += row_dict["diff_qty"]
+            source_links[key].append(row_dict["id"])
 
         existing_diffs = conn.execute(
-            "SELECT id, location, sku, status, remark FROM differences"
+            "SELECT id, location, sku, merge_key, status, remark FROM differences"
         ).fetchall()
-        existing_map = {
-            f"{r['location']}|{r['sku']}": dict(r) for r in existing_diffs
-        }
+        existing_map = {r["merge_key"]: dict(r) for r in existing_diffs}
 
+        old_history = conn.execute(
+            "SELECT difference_id, action_type, old_status, new_status, "
+            "old_remark, new_remark, operator, created_at FROM review_history"
+        ).fetchall()
+
+        conn.execute("DELETE FROM review_history")
         conn.execute("DELETE FROM diff_sources")
         conn.execute("DELETE FROM differences")
 
         created = 0
         preserved_status = 0
+        new_id_map: Dict[str, int] = {}
 
         for key, diff_data in diff_map.items():
             existing = existing_map.get(key)
@@ -136,23 +151,52 @@ def remerge_all(db_path: str, default_status: str = "pending") -> Dict[str, Any]
 
             cursor = conn.execute(
                 """INSERT INTO differences
-                   (location, sku, total_diff_qty, status, remark)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (location, sku, merge_key, total_diff_qty, status, remark)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (
                     diff_data["location"],
                     diff_data["sku"],
+                    diff_data["merge_key"],
                     diff_data["total_diff_qty"],
                     status,
                     remark,
                 )
             )
             diff_id = cursor.lastrowid
+            new_id_map[key] = diff_id
             created += 1
 
             for source_id in source_links[key]:
                 conn.execute(
                     "INSERT INTO diff_sources (difference_id, source_line_id) VALUES (?, ?)",
                     (diff_id, source_id)
+                )
+
+        old_to_new: Dict[int, int] = {}
+        for merge_key, old_info in existing_map.items():
+            new_id = new_id_map.get(merge_key)
+            if new_id is not None:
+                old_to_new[old_info["id"]] = new_id
+
+        for row in old_history:
+            h = dict(row)
+            new_id = old_to_new.get(h["difference_id"])
+            if new_id is not None:
+                conn.execute(
+                    """INSERT INTO review_history
+                       (difference_id, action_type, old_status, new_status,
+                        old_remark, new_remark, operator, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_id,
+                        h["action_type"],
+                        h["old_status"],
+                        h["new_status"],
+                        h["old_remark"],
+                        h["new_remark"],
+                        h["operator"],
+                        h["created_at"],
+                    )
                 )
 
         conn.commit()

@@ -30,6 +30,8 @@ def validate_row(
 ) -> Tuple[bool, str, Dict[str, Any]]:
     """校验一行数据的合法性.
 
+    缺少 counted_qty 时明确报错并阻止入库，不默默按 0 处理。
+
     Args:
         row: CSV 行数据
         csv_config: CSV 列配置
@@ -57,10 +59,14 @@ def validate_row(
     except (ValueError, TypeError):
         return False, f"第 {line_number} 行: 账面数量非法 - {row.get(exp_col)}", {}
 
+    raw_counted = row.get(cnt_col)
+    if raw_counted is None or str(raw_counted).strip() == "":
+        return False, f"第 {line_number} 行: 实盘数量(counted_qty)为空，无法导入", {}
+
     try:
-        counted_qty = float(row.get(cnt_col) or 0)
+        counted_qty = float(raw_counted)
     except (ValueError, TypeError):
-        return False, f"第 {line_number} 行: 实盘数量非法 - {row.get(cnt_col)}", {}
+        return False, f"第 {line_number} 行: 实盘数量非法 - {raw_counted}", {}
 
     diff_qty = counted_qty - expected_qty
 
@@ -76,14 +82,35 @@ def validate_row(
     return True, "", parsed
 
 
+def compute_merge_key(parsed_row: Dict[str, Any], merge_keys: List[str]) -> str:
+    """根据配置的合并键计算 merge_key 字符串.
+
+    合并键由 rules.merge_keys 驱动，而非硬编码 location+sku。
+
+    Args:
+        parsed_row: 解析后的行数据
+        merge_keys: 合并键字段名列表
+
+    Returns:
+        合并键字符串
+    """
+    parts = [str(parsed_row.get(key, "")) for key in merge_keys]
+    return "|".join(parts)
+
+
 def import_csv(
     db_path: str,
     csv_path: str,
     csv_config: Dict[str, Any],
     batch_name: str = None,
     default_status: str = "pending",
+    rules: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """导入盘点 CSV 文件.
+
+    规则配置驱动阈值过滤和合并键计算：
+    - rules.diff_threshold: 差异绝对值低于阈值的不入库
+    - rules.merge_keys: 决定合并分组的字段
 
     Args:
         db_path: 数据库路径
@@ -91,10 +118,16 @@ def import_csv(
         csv_config: CSV 列配置
         batch_name: 批次名称，默认使用文件名
         default_status: 新差异的默认状态
+        rules: 规则配置
 
     Returns:
         导入结果字典
     """
+    if rules is None:
+        rules = {"diff_threshold": 0, "merge_keys": ["location", "sku"]}
+    diff_threshold = float(rules.get("diff_threshold", 0))
+    merge_keys = list(rules.get("merge_keys", ["location", "sku"]))
+
     csv_path = os.path.abspath(csv_path)
 
     if not os.path.exists(csv_path):
@@ -125,13 +158,26 @@ def import_csv(
 
     encoding = csv_config.get("encoding", "utf-8-sig")
     delimiter = csv_config.get("delimiter", ",")
+    cnt_col = csv_config["counted_column"]
 
     valid_rows: List[Dict[str, Any]] = []
     errors: List[str] = []
     zero_diff_count = 0
+    below_threshold_count = 0
 
     with open(csv_path, "r", encoding=encoding) as f:
         reader = csv.DictReader(f, delimiter=delimiter)
+        fieldnames = reader.fieldnames or []
+        if cnt_col not in fieldnames:
+            return {
+                "success": False,
+                "error": f"CSV 缺少必需列: '{cnt_col}'，无法导入",
+                "batch_id": None,
+                "imported": 0,
+                "skipped": 0,
+                "errors": [f"缺少列: {cnt_col}"],
+            }
+
         for i, row in enumerate(reader, start=2):
             is_valid, err_msg, parsed = validate_row(row, csv_config, i)
             if not is_valid:
@@ -142,6 +188,11 @@ def import_csv(
                 zero_diff_count += 1
                 continue
 
+            if diff_threshold > 0 and abs(parsed["diff_qty"]) < diff_threshold:
+                below_threshold_count += 1
+                continue
+
+            parsed["merge_key"] = compute_merge_key(parsed, merge_keys)
             valid_rows.append(parsed)
 
     if not valid_rows:
@@ -151,23 +202,23 @@ def import_csv(
             "batch_id": None,
             "imported": 0,
             "skipped": zero_diff_count,
+            "below_threshold_skipped": below_threshold_count,
             "errors": errors,
         }
 
     batch_id = db.create_batch(db_path, batch_name, csv_path, file_hash)
     source_ids = db.insert_source_lines(db_path, batch_id, valid_rows)
 
-    merged_count = 0
     for i, row in enumerate(valid_rows):
         db.upsert_difference(
             db_path,
             row["location"],
             row["sku"],
+            row["merge_key"],
             row["diff_qty"],
             source_ids[i],
             default_status,
         )
-        merged_count += 1
 
     return {
         "success": True,
@@ -175,6 +226,7 @@ def import_csv(
         "batch_name": batch_name,
         "imported": len(valid_rows),
         "zero_diff_skipped": zero_diff_count,
+        "below_threshold_skipped": below_threshold_count,
         "error_count": len(errors),
         "errors": errors,
     }

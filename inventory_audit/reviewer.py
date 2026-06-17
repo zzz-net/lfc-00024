@@ -1,10 +1,10 @@
 """复核操作模块 - 状态管理、备注、撤销功能."""
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from . import db
 
 
-ALLOWED_STATUSES = {"pending", "confirmed", "ignored", "closed"}
+DEFAULT_ALLOWED_STATUSES = ["pending", "confirmed", "ignored", "closed"]
 
 STATUS_LABELS = {
     "pending": "待处理",
@@ -14,16 +14,23 @@ STATUS_LABELS = {
 }
 
 
-def validate_status(status: str) -> bool:
+def validate_status(
+    status: str,
+    allowed_statuses: Optional[Sequence[str]] = None,
+) -> bool:
     """校验状态是否合法.
+
+    合法状态列表来自配置 config.status.allowed，而非硬编码集合。
 
     Args:
         status: 状态值
+        allowed_statuses: 允许的状态列表，None 时用默认值
 
     Returns:
         是否合法
     """
-    return status.lower() in ALLOWED_STATUSES
+    allowed = set(allowed_statuses) if allowed_statuses else set(DEFAULT_ALLOWED_STATUSES)
+    return status.lower() in allowed
 
 
 def set_status(
@@ -31,6 +38,7 @@ def set_status(
     diff_id: int,
     status: str,
     operator: str = "cli",
+    allowed_statuses: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """设置差异状态.
 
@@ -39,15 +47,17 @@ def set_status(
         diff_id: 差异 ID
         status: 新状态
         operator: 操作人
+        allowed_statuses: 允许的状态列表（来自配置）
 
     Returns:
         操作结果
     """
     status = status.lower()
-    if not validate_status(status):
+    allowed = list(allowed_statuses) if allowed_statuses else DEFAULT_ALLOWED_STATUSES
+    if not validate_status(status, allowed):
         return {
             "success": False,
-            "error": f"无效状态: {status}，允许的值: {', '.join(sorted(ALLOWED_STATUSES))}",
+            "error": f"无效状态: {status}，允许的值: {', '.join(allowed)}",
         }
 
     diff = db.get_difference(db_path, diff_id)
@@ -136,6 +146,7 @@ def batch_set_status(
     diff_ids: List[int],
     status: str,
     operator: str = "cli",
+    allowed_statuses: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """批量设置状态.
 
@@ -144,12 +155,14 @@ def batch_set_status(
         diff_ids: 差异 ID 列表
         status: 新状态
         operator: 操作人
+        allowed_statuses: 允许的状态列表（来自配置）
 
     Returns:
         操作结果
     """
     status = status.lower()
-    if not validate_status(status):
+    allowed = list(allowed_statuses) if allowed_statuses else DEFAULT_ALLOWED_STATUSES
+    if not validate_status(status, allowed):
         return {
             "success": False,
             "error": f"无效状态: {status}",
@@ -161,7 +174,7 @@ def batch_set_status(
     failed: List[Dict[str, Any]] = []
 
     for did in diff_ids:
-        result = set_status(db_path, did, status, operator)
+        result = set_status(db_path, did, status, operator, allowed)
         if result.get("success"):
             updated += 1
         else:

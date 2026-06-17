@@ -36,12 +36,13 @@ CREATE TABLE IF NOT EXISTS differences (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     location TEXT NOT NULL,
     sku TEXT NOT NULL,
+    merge_key TEXT NOT NULL,
     total_diff_qty REAL NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
     remark TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(location, sku)
+    UNIQUE(merge_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_diff_status ON differences(status);
@@ -70,9 +71,16 @@ CREATE TABLE IF NOT EXISTS review_history (
 CREATE INDEX IF NOT EXISTS idx_review_diff ON review_history(difference_id);
 """
 
+INDEX_MERGE_KEY_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_diff_merge_key ON differences(merge_key);"
+)
+
 
 def init_db(db_path: str) -> None:
-    """初始化数据库，创建所有表.
+    """初始化数据库，创建所有表并执行必要迁移.
+
+    迁移顺序：先建表（IF NOT EXISTS），再迁移旧表补 merge_key 列，
+    最后建依赖 merge_key 的索引，避免旧库因列不存在而报错。
 
     Args:
         db_path: 数据库文件路径
@@ -80,7 +88,57 @@ def init_db(db_path: str) -> None:
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     with get_conn(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _migrate_differences_table(conn)
+        conn.execute(INDEX_MERGE_KEY_SQL)
         conn.commit()
+
+
+def _migrate_differences_table(conn) -> None:
+    """迁移旧版 differences 表：补充 merge_key 列并切换唯一约束.
+
+    旧表以 UNIQUE(location, sku) 作为合并键，新版改为 UNIQUE(merge_key)，
+    由配置中的 rules.merge_keys 驱动。迁移时用 location|sku 回填 merge_key，
+    不破坏已有批次、状态和备注。
+    """
+    cols = conn.execute("PRAGMA table_info(differences)").fetchall()
+    col_names = {c["name"] for c in cols}
+    if "merge_key" in col_names:
+        return
+
+    conn.execute("PRAGMA foreign_keys = OFF")
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS differences_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            location TEXT NOT NULL,
+            sku TEXT NOT NULL,
+            merge_key TEXT NOT NULL,
+            total_diff_qty REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            remark TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(merge_key)
+        );
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO differences_new
+            (id, location, sku, merge_key, total_diff_qty, status, remark, created_at, updated_at)
+        SELECT id, location, sku,
+               location || '|' || sku,
+               total_diff_qty, status, remark, created_at, updated_at
+        FROM differences
+        """
+    )
+    conn.execute("DROP TABLE IF EXISTS differences")
+    conn.execute("ALTER TABLE differences_new RENAME TO differences")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_diff_status ON differences(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_diff_merge_key ON differences(merge_key)")
+
+    conn.execute("PRAGMA foreign_keys = ON")
 
 
 @contextmanager
@@ -191,16 +249,21 @@ def upsert_difference(
     db_path: str,
     location: str,
     sku: str,
+    merge_key: str,
     diff_qty_delta: float,
     source_line_id: int,
     default_status: str = "pending",
 ) -> int:
     """插入或更新差异，并关联来源行.
 
+    合并键由配置 rules.merge_keys 驱动，经调用方计算为 merge_key 传入，
+    不再硬编码 location+sku。
+
     Args:
         db_path: 数据库路径
-        location: 库位
-        sku: SKU
+        location: 库位（用于展示）
+        sku: SKU（用于展示）
+        merge_key: 合并键（由 rules.merge_keys 计算）
         diff_qty_delta: 差异数量增量
         source_line_id: 来源行 ID
         default_status: 默认状态
@@ -210,8 +273,8 @@ def upsert_difference(
     """
     with get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT id, total_diff_qty FROM differences WHERE location = ? AND sku = ?",
-            (location, sku)
+            "SELECT id, total_diff_qty FROM differences WHERE merge_key = ?",
+            (merge_key,)
         ).fetchone()
 
         if row:
@@ -226,9 +289,9 @@ def upsert_difference(
         else:
             cursor = conn.execute(
                 """INSERT INTO differences
-                   (location, sku, total_diff_qty, status)
-                   VALUES (?, ?, ?, ?)""",
-                (location, sku, diff_qty_delta, default_status)
+                   (location, sku, merge_key, total_diff_qty, status)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (location, sku, merge_key, diff_qty_delta, default_status)
             )
             diff_id = cursor.lastrowid
 
@@ -430,6 +493,9 @@ def get_last_review_action(db_path: str) -> Optional[Dict[str, Any]]:
 def undo_last_review(db_path: str) -> Optional[Dict[str, Any]]:
     """撤销最后一次复核操作.
 
+    状态变更撤销时完整恢复 old_status；若历史记录缺失 old_status（异常情况），
+    回退到 pending 而非 NULL，避免产生脏状态。备注变更同理回退到空串。
+
     Args:
         db_path: 数据库路径
 
@@ -447,14 +513,16 @@ def undo_last_review(db_path: str) -> Optional[Dict[str, Any]]:
         diff_id = history["difference_id"]
 
         if history["action_type"] == "status_change":
+            restore_status = history["old_status"] or "pending"
             conn.execute(
                 "UPDATE differences SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (history["old_status"], diff_id)
+                (restore_status, diff_id)
             )
         elif history["action_type"] == "remark_change":
+            restore_remark = history["old_remark"] if history["old_remark"] is not None else ""
             conn.execute(
                 "UPDATE differences SET remark = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (history["old_remark"], diff_id)
+                (restore_remark, diff_id)
             )
 
         conn.execute("DELETE FROM review_history WHERE id = ?", (history["id"],))

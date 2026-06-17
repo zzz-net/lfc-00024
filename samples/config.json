@@ -10,6 +10,10 @@
     "encoding": "utf-8-sig",
     "delimiter": ","
   },
+  "rules": {
+    "diff_threshold": 0,
+    "merge_keys": ["location", "sku"]
+  },
   "status": {
     "initial": "pending",
     "allowed": ["pending", "confirmed", "ignored", "closed"]

@@ -47,6 +47,7 @@ def cmd_import(args) -> int:
         db_path, csv_path, config["csv"],
         batch_name=batch_name,
         default_status=config["status"]["initial"],
+        rules=cfg.get_rules(config),
     )
 
     if not result["success"]:
@@ -66,6 +67,8 @@ def cmd_import(args) -> int:
     print(f"  批次名称: {result['batch_name']}")
     print(f"  导入差异行: {result['imported']}")
     print(f"  零差异跳过: {result['zero_diff_skipped']}")
+    if result.get("below_threshold_skipped", 0) > 0:
+        print(f"  低于阈值跳过: {result['below_threshold_skipped']}")
 
     if result.get("error_count", 0) > 0:
         print(f"  数据错误: {result['error_count']} 条")
@@ -162,11 +165,12 @@ def cmd_status(args) -> int:
 
     diff_ids = args.diff_ids
     status = args.status
+    allowed = cfg.get_allowed_statuses(config)
 
     if len(diff_ids) == 1:
-        result = reviewer.set_status(db_path, diff_ids[0], status)
+        result = reviewer.set_status(db_path, diff_ids[0], status, allowed_statuses=allowed)
     else:
-        result = reviewer.batch_set_status(db_path, diff_ids, status)
+        result = reviewer.batch_set_status(db_path, diff_ids, status, allowed_statuses=allowed)
 
     if not result.get("success"):
         print(f"[ERROR] {result.get('error', '操作失败')}")
@@ -357,7 +361,10 @@ def cmd_remerge(args) -> int:
             print("已取消")
             return 0
 
-    result = merger.remerge_all(db_path)
+    result = merger.remerge_all(
+        db_path,
+        merge_keys=cfg.get_rules(config)["merge_keys"],
+    )
 
     print(f"[OK] 重新合并完成")
     print(f"  差异总数: {result['total_differences']}")
@@ -407,8 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("diff_ids", type=int, nargs="+", help="差异 ID（可多个）")
     p_status.add_argument(
         "status",
-        choices=["pending", "confirmed", "ignored", "closed"],
-        help="状态: pending(待处理), confirmed(已确认), ignored(忽略), closed(已关闭)",
+        help="状态值 (由配置 status.allowed 决定合法值)",
     )
     p_status.set_defaults(func=cmd_status)
 
