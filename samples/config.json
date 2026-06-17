@@ -1,0 +1,20 @@
+{
+  "database": {
+    "path": "./audit_data/audit.db"
+  },
+  "csv": {
+    "location_column": "location",
+    "sku_column": "sku",
+    "expected_column": "expected_qty",
+    "counted_column": "counted_qty",
+    "encoding": "utf-8-sig",
+    "delimiter": ","
+  },
+  "status": {
+    "initial": "pending",
+    "allowed": ["pending", "confirmed", "ignored", "closed"]
+  },
+  "export": {
+    "output_dir": "./audit_data/exports"
+  }
+}

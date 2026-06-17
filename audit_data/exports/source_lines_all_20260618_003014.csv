@@ -1,0 +1,15 @@
+﻿行ID,批次名称,行号,库位,SKU,账面数量,实盘数量,差异数量
+1,batch1_morning,2,A-01-01,SKU001,100.0,95.0,-5.0
+2,batch1_morning,4,A-01-02,SKU003,200.0,210.0,10.0
+3,batch1_morning,5,A-02-01,SKU001,80.0,88.0,8.0
+4,batch1_morning,6,A-02-01,SKU004,30.0,25.0,-5.0
+5,batch1_morning,8,B-01-02,SKU006,150.0,140.0,-10.0
+6,batch1_morning,11,C-01-01,SKU008,75.0,70.0,-5.0
+7,batch1_morning,12,C-01-01,SKU009,40.0,45.0,5.0
+8,batch2_afternoon,2,A-01-01,SKU001,100.0,92.0,-8.0
+9,batch2_afternoon,3,A-01-02,SKU003,200.0,205.0,5.0
+10,batch2_afternoon,4,A-03-01,SKU010,120.0,115.0,-5.0
+11,batch2_afternoon,5,B-01-02,SKU006,150.0,145.0,-5.0
+12,batch2_afternoon,6,C-01-01,SKU008,75.0,72.0,-3.0
+13,batch2_afternoon,7,C-02-01,SKU011,90.0,93.0,3.0
+14,batch2_afternoon,8,C-02-01,SKU012,55.0,0.0,-55.0
