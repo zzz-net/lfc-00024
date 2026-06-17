@@ -1,0 +1,17 @@
+{
+  "id": 1,
+  "name": "cli-plan",
+  "filter_status": "pending",
+  "filter_location": null,
+  "filter_sku": null,
+  "export_fields": [
+    "id",
+    "location",
+    "sku",
+    "status",
+    "remark"
+  ],
+  "remark_template": "cli 模板",
+  "created_at": "2026-06-17 17:54:15",
+  "updated_at": "2026-06-17 17:54:15"
+}

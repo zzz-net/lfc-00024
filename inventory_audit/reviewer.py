@@ -39,6 +39,8 @@ def set_status(
     status: str,
     operator: str = "cli",
     allowed_statuses: Optional[Sequence[str]] = None,
+    plan_id: Optional[int] = None,
+    plan_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """设置差异状态.
 
@@ -48,6 +50,8 @@ def set_status(
         status: 新状态
         operator: 操作人
         allowed_statuses: 允许的状态列表（来自配置）
+        plan_id: 方案 ID
+        plan_name: 方案名称
 
     Returns:
         操作结果
@@ -78,7 +82,10 @@ def set_status(
             "new_status": status,
         }
 
-    ok = db.update_difference_status(db_path, diff_id, status, operator)
+    ok = db.update_difference_status(
+        db_path, diff_id, status, operator,
+        plan_id=plan_id, plan_name=plan_name,
+    )
     if not ok:
         return {
             "success": False,
@@ -90,6 +97,8 @@ def set_status(
         "diff_id": diff_id,
         "old_status": old_status,
         "new_status": status,
+        "plan_id": plan_id,
+        "plan_name": plan_name,
     }
 
 
@@ -98,6 +107,8 @@ def set_remark(
     diff_id: int,
     remark: str,
     operator: str = "cli",
+    plan_id: Optional[int] = None,
+    plan_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """设置差异备注.
 
@@ -106,6 +117,8 @@ def set_remark(
         diff_id: 差异 ID
         remark: 备注内容
         operator: 操作人
+        plan_id: 方案 ID
+        plan_name: 方案名称
 
     Returns:
         操作结果
@@ -126,7 +139,10 @@ def set_remark(
             "diff_id": diff_id,
         }
 
-    ok = db.update_difference_remark(db_path, diff_id, remark, operator)
+    ok = db.update_difference_remark(
+        db_path, diff_id, remark, operator,
+        plan_id=plan_id, plan_name=plan_name,
+    )
     if not ok:
         return {
             "success": False,
@@ -138,6 +154,8 @@ def set_remark(
         "diff_id": diff_id,
         "old_remark": old_remark,
         "new_remark": remark,
+        "plan_id": plan_id,
+        "plan_name": plan_name,
     }
 
 
@@ -147,6 +165,8 @@ def batch_set_status(
     status: str,
     operator: str = "cli",
     allowed_statuses: Optional[Sequence[str]] = None,
+    plan_id: Optional[int] = None,
+    plan_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """批量设置状态.
 
@@ -156,6 +176,8 @@ def batch_set_status(
         status: 新状态
         operator: 操作人
         allowed_statuses: 允许的状态列表（来自配置）
+        plan_id: 方案 ID
+        plan_name: 方案名称
 
     Returns:
         操作结果
@@ -174,7 +196,10 @@ def batch_set_status(
     failed: List[Dict[str, Any]] = []
 
     for did in diff_ids:
-        result = set_status(db_path, did, status, operator, allowed)
+        result = set_status(
+            db_path, did, status, operator, allowed,
+            plan_id=plan_id, plan_name=plan_name,
+        )
         if result.get("success"):
             updated += 1
         else:
@@ -188,16 +213,27 @@ def batch_set_status(
     }
 
 
-def undo_last(db_path: str) -> Dict[str, Any]:
+def undo_last(
+    db_path: str,
+    operator: str = "cli",
+    plan_id: Optional[int] = None,
+    plan_name: Optional[str] = None,
+) -> Dict[str, Any]:
     """撤销最后一次复核操作.
 
     Args:
         db_path: 数据库路径
+        operator: 操作人
+        plan_id: 方案 ID
+        plan_name: 方案名称
 
     Returns:
         撤销结果
     """
-    history = db.undo_last_review(db_path)
+    history = db.undo_last_review(
+        db_path, operator=operator,
+        plan_id=plan_id, plan_name=plan_name,
+    )
     if not history:
         return {
             "success": False,

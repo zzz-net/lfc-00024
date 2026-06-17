@@ -6,7 +6,34 @@ from typing import Any, Dict, List, Optional
 
 from . import db
 from . import merger
+from . import plans as plans_mod
 from . import reviewer
+
+
+FIELD_LABELS = {
+    "id": "差异ID",
+    "location": "库位",
+    "sku": "SKU",
+    "total_diff_qty": "差异数量",
+    "status": "状态",
+    "remark": "备注",
+    "batch_names": "来源批次",
+    "source_count": "来源行数",
+    "created_at": "创建时间",
+    "updated_at": "更新时间",
+    "merge_key": "合并键",
+}
+
+
+def _build_row(diff: Dict[str, Any], field: str) -> Any:
+    """按字段名从差异对象提取导出值."""
+    if field == "status":
+        return reviewer.get_status_label(diff.get("status", ""))
+    if field == "batch_names":
+        return "; ".join(diff.get("batch_names", []))
+    if field == "source_count":
+        return diff.get("source_count", 0)
+    return diff.get(field, "")
 
 
 def export_differences(
@@ -15,72 +42,62 @@ def export_differences(
     status: Optional[str] = None,
     include_sources: bool = True,
     filename_prefix: str = "audit_report",
+    plan: Optional[Dict[str, Any]] = None,
+    operator: str = "cli",
 ) -> Dict[str, Any]:
     """导出差异报告为 CSV.
 
     Args:
         db_path: 数据库路径
         output_dir: 输出目录
-        status: 按状态过滤，None 表示全部
+        status: 按状态过滤，None 表示全部（方案优先级低于显式传参）
         include_sources: 是否包含来源行明细
         filename_prefix: 文件名前缀
+        plan: 当前方案，用于驱动导出字段与文件名元数据
+        operator: 操作人（用于操作日志）
 
     Returns:
         导出结果
     """
     os.makedirs(output_dir, exist_ok=True)
 
+    export_fields = plans_mod.resolve_export_fields(plan)
+
     diffs = merger.get_merged_differences(db_path, status=status)
 
     if not diffs:
-        return {
+        result = {
             "success": False,
             "error": "没有差异数据可导出",
             "file_path": None,
             "count": 0,
         }
+        return result
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     status_part = f"_{status}" if status else "_all"
-    filename = f"{filename_prefix}{status_part}_{timestamp}.csv"
+    plan_part = f"_plan{plan['id']}" if plan else ""
+    filename = f"{filename_prefix}{status_part}{plan_part}_{timestamp}.csv"
     file_path = os.path.join(output_dir, filename)
 
     with open(file_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
 
-        headers = [
-            "差异ID",
-            "库位",
-            "SKU",
-            "差异数量",
-            "状态",
-            "备注",
-            "来源批次",
-            "来源行数",
-            "创建时间",
-            "更新时间",
-        ]
+        writer.writerow([
+            "# 导出时间:", datetime.now().isoformat(timespec="seconds"),
+            "方案:", plan["name"] if plan else "(无)",
+            "操作人:", operator,
+            "状态过滤:", status or "(全部)",
+            "导出字段:", ",".join(export_fields),
+        ])
+
+        headers = [FIELD_LABELS.get(f, f) for f in export_fields]
         if include_sources:
             headers.append("来源行明细")
         writer.writerow(headers)
 
         for diff in diffs:
-            status_label = reviewer.get_status_label(diff["status"])
-            batch_names = "; ".join(diff.get("batch_names", []))
-            line_nums = ", ".join(str(n) for n in diff.get("line_numbers", []))
-
-            row = [
-                diff["id"],
-                diff["location"],
-                diff["sku"],
-                diff["total_diff_qty"],
-                status_label,
-                diff.get("remark", ""),
-                batch_names,
-                diff.get("source_count", 0),
-                diff.get("created_at", ""),
-                diff.get("updated_at", ""),
-            ]
+            row = [_build_row(diff, f) for f in export_fields]
 
             if include_sources:
                 detail = db.get_difference(db_path, diff["id"])
@@ -98,11 +115,22 @@ def export_differences(
 
             writer.writerow(row)
 
+    abs_path = os.path.abspath(file_path)
+    plan_id = plan["id"] if plan else None
+    plan_name = plan["name"] if plan else None
+    db.log_export_operation(
+        db_path, "differences", abs_path, len(diffs),
+        operator=operator, plan_id=plan_id, plan_name=plan_name,
+        status_filter=status,
+    )
+
     return {
         "success": True,
-        "file_path": os.path.abspath(file_path),
+        "file_path": abs_path,
         "count": len(diffs),
         "filename": filename,
+        "plan_id": plan_id,
+        "plan_name": plan_name,
     }
 
 
@@ -110,6 +138,8 @@ def export_summary(
     db_path: str,
     output_dir: str,
     filename_prefix: str = "summary",
+    plan: Optional[Dict[str, Any]] = None,
+    operator: str = "cli",
 ) -> Dict[str, Any]:
     """导出汇总统计报告.
 
@@ -117,6 +147,8 @@ def export_summary(
         db_path: 数据库路径
         output_dir: 输出目录
         filename_prefix: 文件名前缀
+        plan: 当前方案（写入元数据）
+        operator: 操作人
 
     Returns:
         导出结果
@@ -127,11 +159,17 @@ def export_summary(
     batches = db.list_batches(db_path)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{filename_prefix}_{timestamp}.csv"
+    plan_part = f"_plan{plan['id']}" if plan else ""
+    filename = f"{filename_prefix}{plan_part}_{timestamp}.csv"
     file_path = os.path.join(output_dir, filename)
 
     with open(file_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
+        writer.writerow([
+            "# 导出时间:", datetime.now().isoformat(timespec="seconds"),
+            "方案:", plan["name"] if plan else "(无)",
+            "操作人:", operator,
+        ])
 
         writer.writerow(["=== 总体汇总 ==="])
         writer.writerow(["指标", "数值"])
@@ -164,11 +202,21 @@ def export_summary(
                 f"{batch['status']} ({source_count} 行)",
             ])
 
+    abs_path = os.path.abspath(file_path)
+    plan_id = plan["id"] if plan else None
+    plan_name = plan["name"] if plan else None
+    db.log_export_operation(
+        db_path, "summary", abs_path, summary["total_differences"],
+        operator=operator, plan_id=plan_id, plan_name=plan_name,
+    )
+
     return {
         "success": True,
-        "file_path": os.path.abspath(file_path),
+        "file_path": abs_path,
         "filename": filename,
         "summary": summary,
+        "plan_id": plan_id,
+        "plan_name": plan_name,
     }
 
 
@@ -177,6 +225,8 @@ def export_source_lines(
     output_dir: str,
     batch_id: Optional[int] = None,
     filename_prefix: str = "source_lines",
+    plan: Optional[Dict[str, Any]] = None,
+    operator: str = "cli",
 ) -> Dict[str, Any]:
     """导出来源行明细.
 
@@ -185,6 +235,8 @@ def export_source_lines(
         output_dir: 输出目录
         batch_id: 批次 ID，None 表示全部
         filename_prefix: 文件名前缀
+        plan: 当前方案（写入元数据）
+        operator: 操作人
 
     Returns:
         导出结果
@@ -219,11 +271,18 @@ def export_source_lines(
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     batch_part = f"_batch{batch_id}" if batch_id else "_all"
-    filename = f"{filename_prefix}{batch_part}_{timestamp}.csv"
+    plan_part = f"_plan{plan['id']}" if plan else ""
+    filename = f"{filename_prefix}{batch_part}{plan_part}_{timestamp}.csv"
     file_path = os.path.join(output_dir, filename)
 
     with open(file_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
+        writer.writerow([
+            "# 导出时间:", datetime.now().isoformat(timespec="seconds"),
+            "方案:", plan["name"] if plan else "(无)",
+            "操作人:", operator,
+            "批次:", batch_id or "(全部)",
+        ])
         writer.writerow([
             "行ID", "批次名称", "行号", "库位", "SKU",
             "账面数量", "实盘数量", "差异数量",
@@ -240,9 +299,20 @@ def export_source_lines(
                 row["diff_qty"],
             ])
 
+    abs_path = os.path.abspath(file_path)
+    plan_id = plan["id"] if plan else None
+    plan_name = plan["name"] if plan else None
+    db.log_export_operation(
+        db_path, "sources", abs_path, len(rows),
+        operator=operator, plan_id=plan_id, plan_name=plan_name,
+        batch_id=batch_id,
+    )
+
     return {
         "success": True,
-        "file_path": os.path.abspath(file_path),
+        "file_path": abs_path,
         "count": len(rows),
         "filename": filename,
+        "plan_id": plan_id,
+        "plan_name": plan_name,
     }

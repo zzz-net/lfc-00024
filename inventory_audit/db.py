@@ -1,4 +1,5 @@
 """数据库操作模块 - 使用 SQLite 存储批次、差异和复核历史."""
+import json
 import sqlite3
 import os
 from contextlib import contextmanager
@@ -64,11 +65,41 @@ CREATE TABLE IF NOT EXISTS review_history (
     old_remark TEXT,
     new_remark TEXT,
     operator TEXT DEFAULT 'cli',
+    plan_id INTEGER,
+    plan_name TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (difference_id) REFERENCES differences(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_review_diff ON review_history(difference_id);
+
+CREATE TABLE IF NOT EXISTS plans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    filter_status TEXT,
+    filter_location TEXT,
+    filter_sku TEXT,
+    export_fields TEXT,
+    remark_template TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS operation_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id INTEGER,
+    plan_name TEXT,
+    operator TEXT DEFAULT 'cli',
+    action_type TEXT NOT NULL,
+    target_diff_id INTEGER,
+    action_data TEXT,
+    snapshot_before TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_op_log_plan ON operation_logs(plan_id);
+CREATE INDEX IF NOT EXISTS idx_op_log_created ON operation_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_op_log_target ON operation_logs(target_diff_id);
 """
 
 INDEX_MERGE_KEY_SQL = (
@@ -76,11 +107,18 @@ INDEX_MERGE_KEY_SQL = (
 )
 
 
+POST_MIGRATION_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_review_plan ON review_history(plan_id);
+CREATE INDEX IF NOT EXISTS idx_review_created ON review_history(created_at);
+"""
+
+
 def init_db(db_path: str) -> None:
     """初始化数据库，创建所有表并执行必要迁移.
 
     迁移顺序：先建表（IF NOT EXISTS），再迁移旧表补 merge_key 列，
-    最后建依赖 merge_key 的索引，避免旧库因列不存在而报错。
+    再补 review_history 的 plan_id / plan_name 列，
+    最后建依赖新列的索引，避免旧库因列不存在而报错。
 
     Args:
         db_path: 数据库文件路径
@@ -89,8 +127,20 @@ def init_db(db_path: str) -> None:
     with get_conn(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
         _migrate_differences_table(conn)
+        _migrate_review_history_table(conn)
         conn.execute(INDEX_MERGE_KEY_SQL)
+        conn.executescript(POST_MIGRATION_INDEX_SQL)
         conn.commit()
+
+
+def _migrate_review_history_table(conn) -> None:
+    """迁移旧版 review_history 表：补充 plan_id 和 plan_name 列."""
+    cols = conn.execute("PRAGMA table_info(review_history)").fetchall()
+    col_names = {c["name"] for c in cols}
+    if "plan_id" not in col_names:
+        conn.execute("ALTER TABLE review_history ADD COLUMN plan_id INTEGER")
+    if "plan_name" not in col_names:
+        conn.execute("ALTER TABLE review_history ADD COLUMN plan_name TEXT")
 
 
 def _migrate_differences_table(conn) -> None:
@@ -389,6 +439,8 @@ def update_difference_status(
     diff_id: int,
     new_status: str,
     operator: str = "cli",
+    plan_id: Optional[int] = None,
+    plan_name: Optional[str] = None,
 ) -> bool:
     """更新差异状态，并记录历史.
 
@@ -397,13 +449,15 @@ def update_difference_status(
         diff_id: 差异 ID
         new_status: 新状态
         operator: 操作人
+        plan_id: 方案 ID
+        plan_name: 方案名称
 
     Returns:
         是否成功
     """
     with get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT status FROM differences WHERE id = ?",
+            "SELECT status, remark FROM differences WHERE id = ?",
             (diff_id,)
         ).fetchone()
         if not row:
@@ -413,6 +467,8 @@ def update_difference_status(
         if old_status == new_status:
             return True
 
+        snapshot_before = json.dumps({"status": old_status, "remark": row["remark"] or ""}, ensure_ascii=False)
+
         conn.execute(
             """UPDATE differences
                SET status = ?, updated_at = CURRENT_TIMESTAMP
@@ -421,9 +477,16 @@ def update_difference_status(
         )
         conn.execute(
             """INSERT INTO review_history
-               (difference_id, action_type, old_status, new_status)
-               VALUES (?, 'status_change', ?, ?)""",
-            (diff_id, old_status, new_status)
+               (difference_id, action_type, old_status, new_status, operator, plan_id, plan_name)
+               VALUES (?, 'status_change', ?, ?, ?, ?, ?)""",
+            (diff_id, old_status, new_status, operator, plan_id, plan_name)
+        )
+        action_data = json.dumps({"old_status": old_status, "new_status": new_status}, ensure_ascii=False)
+        conn.execute(
+            """INSERT INTO operation_logs
+               (plan_id, plan_name, operator, action_type, target_diff_id, action_data, snapshot_before)
+               VALUES (?, ?, ?, 'status_change', ?, ?, ?)""",
+            (plan_id, plan_name, operator, diff_id, action_data, snapshot_before)
         )
         conn.commit()
         return True
@@ -434,6 +497,8 @@ def update_difference_remark(
     diff_id: int,
     new_remark: str,
     operator: str = "cli",
+    plan_id: Optional[int] = None,
+    plan_name: Optional[str] = None,
 ) -> bool:
     """更新差异备注，并记录历史.
 
@@ -442,13 +507,15 @@ def update_difference_remark(
         diff_id: 差异 ID
         new_remark: 新备注
         operator: 操作人
+        plan_id: 方案 ID
+        plan_name: 方案名称
 
     Returns:
         是否成功
     """
     with get_conn(db_path) as conn:
         row = conn.execute(
-            "SELECT remark FROM differences WHERE id = ?",
+            "SELECT status, remark FROM differences WHERE id = ?",
             (diff_id,)
         ).fetchone()
         if not row:
@@ -458,6 +525,8 @@ def update_difference_remark(
         if old_remark == new_remark:
             return True
 
+        snapshot_before = json.dumps({"status": row["status"], "remark": old_remark}, ensure_ascii=False)
+
         conn.execute(
             """UPDATE differences
                SET remark = ?, updated_at = CURRENT_TIMESTAMP
@@ -466,9 +535,16 @@ def update_difference_remark(
         )
         conn.execute(
             """INSERT INTO review_history
-               (difference_id, action_type, old_remark, new_remark)
-               VALUES (?, 'remark_change', ?, ?)""",
-            (diff_id, old_remark, new_remark)
+               (difference_id, action_type, old_remark, new_remark, operator, plan_id, plan_name)
+               VALUES (?, 'remark_change', ?, ?, ?, ?, ?)""",
+            (diff_id, old_remark, new_remark, operator, plan_id, plan_name)
+        )
+        action_data = json.dumps({"old_remark": old_remark, "new_remark": new_remark}, ensure_ascii=False)
+        conn.execute(
+            """INSERT INTO operation_logs
+               (plan_id, plan_name, operator, action_type, target_diff_id, action_data, snapshot_before)
+               VALUES (?, ?, ?, 'remark_change', ?, ?, ?)""",
+            (plan_id, plan_name, operator, diff_id, action_data, snapshot_before)
         )
         conn.commit()
         return True
@@ -490,7 +566,12 @@ def get_last_review_action(db_path: str) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
 
 
-def undo_last_review(db_path: str) -> Optional[Dict[str, Any]]:
+def undo_last_review(
+    db_path: str,
+    operator: str = "cli",
+    plan_id: Optional[int] = None,
+    plan_name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """撤销最后一次复核操作.
 
     状态变更撤销时完整恢复 old_status；若历史记录缺失 old_status（异常情况），
@@ -498,6 +579,9 @@ def undo_last_review(db_path: str) -> Optional[Dict[str, Any]]:
 
     Args:
         db_path: 数据库路径
+        operator: 操作人
+        plan_id: 方案 ID
+        plan_name: 方案名称
 
     Returns:
         被撤销的操作信息，无可撤销时返回 None
@@ -511,6 +595,14 @@ def undo_last_review(db_path: str) -> Optional[Dict[str, Any]]:
 
         history = dict(row)
         diff_id = history["difference_id"]
+
+        diff_row = conn.execute(
+            "SELECT status, remark FROM differences WHERE id = ?",
+            (diff_id,)
+        ).fetchone()
+        snapshot_before = None
+        if diff_row:
+            snapshot_before = json.dumps({"status": diff_row["status"], "remark": diff_row["remark"] or ""}, ensure_ascii=False)
 
         if history["action_type"] == "status_change":
             restore_status = history["old_status"] or "pending"
@@ -526,6 +618,18 @@ def undo_last_review(db_path: str) -> Optional[Dict[str, Any]]:
             )
 
         conn.execute("DELETE FROM review_history WHERE id = ?", (history["id"],))
+
+        action_data = json.dumps({
+            "undone_history_id": history["id"],
+            "undone_action_type": history["action_type"],
+            "difference_id": diff_id,
+        }, ensure_ascii=False)
+        conn.execute(
+            """INSERT INTO operation_logs
+               (plan_id, plan_name, operator, action_type, target_diff_id, action_data, snapshot_before)
+               VALUES (?, ?, ?, 'undo', ?, ?, ?)""",
+            (plan_id, plan_name, operator, diff_id, action_data, snapshot_before)
+        )
         conn.commit()
         return history
 
@@ -594,3 +698,207 @@ def get_batch_source_count(db_path: str, batch_id: int) -> int:
             (batch_id,)
         ).fetchone()
         return row["cnt"] if row else 0
+
+
+def save_plan(
+    db_path: str,
+    name: str,
+    filter_status: Optional[str] = None,
+    filter_location: Optional[str] = None,
+    filter_sku: Optional[str] = None,
+    export_fields: Optional[List[str]] = None,
+    remark_template: Optional[str] = None,
+) -> int:
+    """保存或更新复核方案.
+
+    Args:
+        db_path: 数据库路径
+        name: 方案名称（唯一）
+        filter_status: 状态过滤值
+        filter_location: 库位过滤值
+        filter_sku: SKU 过滤值
+        export_fields: 导出字段列表
+        remark_template: 备注模板
+
+    Returns:
+        方案 ID
+    """
+    export_fields_json = json.dumps(export_fields, ensure_ascii=False) if export_fields else None
+    with get_conn(db_path) as conn:
+        row = conn.execute("SELECT id FROM plans WHERE name = ?", (name,)).fetchone()
+        if row:
+            conn.execute(
+                """UPDATE plans SET
+                   filter_status = ?, filter_location = ?, filter_sku = ?,
+                   export_fields = ?, remark_template = ?,
+                   updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (filter_status, filter_location, filter_sku,
+                 export_fields_json, remark_template, row["id"])
+            )
+            conn.commit()
+            return row["id"]
+        else:
+            cursor = conn.execute(
+                """INSERT INTO plans
+                   (name, filter_status, filter_location, filter_sku,
+                    export_fields, remark_template)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (name, filter_status, filter_location, filter_sku,
+                 export_fields_json, remark_template)
+            )
+            conn.commit()
+            return cursor.lastrowid
+
+
+def list_plans(db_path: str) -> List[Dict[str, Any]]:
+    """列出所有方案.
+
+    Args:
+        db_path: 数据库路径
+
+    Returns:
+        方案列表
+    """
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM plans ORDER BY updated_at DESC"
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            if d.get("export_fields"):
+                d["export_fields"] = json.loads(d["export_fields"])
+            result.append(d)
+        return result
+
+
+def get_plan(db_path: str, name: str) -> Optional[Dict[str, Any]]:
+    """按名称获取方案.
+
+    Args:
+        db_path: 数据库路径
+        name: 方案名称
+
+    Returns:
+        方案字典，不存在返回 None
+    """
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM plans WHERE name = ?", (name,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("export_fields"):
+            d["export_fields"] = json.loads(d["export_fields"])
+        return d
+
+
+def delete_plan(db_path: str, name: str) -> bool:
+    """删除方案.
+
+    Args:
+        db_path: 数据库路径
+        name: 方案名称
+
+    Returns:
+        是否删除成功
+    """
+    with get_conn(db_path) as conn:
+        cursor = conn.execute("DELETE FROM plans WHERE name = ?", (name,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def log_export_operation(
+    db_path: str,
+    export_type: str,
+    file_path: str,
+    count: int,
+    operator: str = "cli",
+    plan_id: Optional[int] = None,
+    plan_name: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    batch_id: Optional[int] = None,
+) -> None:
+    """记录导出操作到 operation_logs.
+
+    Args:
+        db_path: 数据库路径
+        export_type: 导出类型 (differences/summary/sources)
+        file_path: 导出文件路径
+        count: 导出记录数
+        operator: 操作人
+        plan_id: 方案 ID
+        plan_name: 方案名称
+        status_filter: 状态过滤
+        batch_id: 批次 ID
+    """
+    action_data = json.dumps({
+        "export_type": export_type,
+        "file_path": file_path,
+        "count": count,
+        "status_filter": status_filter,
+        "batch_id": batch_id,
+    }, ensure_ascii=False)
+    with get_conn(db_path) as conn:
+        conn.execute(
+            """INSERT INTO operation_logs
+               (plan_id, plan_name, operator, action_type, target_diff_id, action_data)
+               VALUES (?, ?, ?, 'export', ?, ?)""",
+            (plan_id, plan_name, operator, None, action_data)
+        )
+        conn.commit()
+
+
+def get_operation_logs(
+    db_path: str,
+    plan_id: Optional[int] = None,
+    plan_name: Optional[str] = None,
+    operator: Optional[str] = None,
+    action_type: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """查询操作日志（用于回放）.
+
+    Args:
+        db_path: 数据库路径
+        plan_id: 按方案 ID 过滤
+        plan_name: 按方案名称过滤
+        operator: 按操作人过滤
+        action_type: 按动作类型过滤
+        limit: 条数限制
+
+    Returns:
+        操作日志列表，按时间升序
+    """
+    query = "SELECT * FROM operation_logs WHERE 1=1"
+    params: List[Any] = []
+    if plan_id is not None:
+        query += " AND plan_id = ?"
+        params.append(plan_id)
+    if plan_name is not None:
+        query += " AND plan_name = ?"
+        params.append(plan_name)
+    if operator is not None:
+        query += " AND operator = ?"
+        params.append(operator)
+    if action_type is not None:
+        query += " AND action_type = ?"
+        params.append(action_type)
+    query += " ORDER BY created_at ASC, id ASC"
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    with get_conn(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            if d.get("action_data"):
+                d["action_data"] = json.loads(d["action_data"])
+            if d.get("snapshot_before"):
+                d["snapshot_before"] = json.loads(d["snapshot_before"])
+            result.append(d)
+        return result

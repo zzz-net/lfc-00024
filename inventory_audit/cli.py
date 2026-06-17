@@ -2,12 +2,14 @@
 import argparse
 import os
 import sys
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from . import config as cfg
 from . import db
 from . import importer
 from . import merger
+from . import plans as plans_mod
+from . import replay as replay_mod
 from . import reviewer
 from . import exporter
 
@@ -23,14 +25,24 @@ def _get_db_path(config: Dict[str, Any]) -> str:
     return cfg.get_db_path(config)
 
 
+def _resolve_current_plan(config: Dict[str, Any], db_path: str) -> Optional[Dict[str, Any]]:
+    """根据 config.active_plan 解析出方案对象；不存在或未设置返回 None."""
+    plan_name = config.get("active_plan")
+    if not plan_name:
+        return None
+    return plans_mod.get_plan(db_path, config, plan_name)
+
+
 def cmd_init(args) -> int:
     """初始化命令 - 创建数据库和目录."""
     config = _load_config(args)
     db_path = _get_db_path(config)
     db.init_db(db_path)
+    cfg.save_runtime_state(config)
     print(f"[OK] 初始化完成")
     print(f"  数据库: {db_path}")
     print(f"  导出目录: {os.path.abspath(config['export']['output_dir'])}")
+    print(f"  操作人: {config.get('operator', 'cli')}")
     return 0
 
 
@@ -42,6 +54,10 @@ def cmd_import(args) -> int:
 
     csv_path = args.csv_file
     batch_name = getattr(args, "name", None)
+
+    batches_before = db.list_batches(db_path)
+    batch_ids_before = {b["id"] for b in batches_before}
+    summary_before = db.get_summary(db_path)
 
     result = importer.import_csv(
         db_path, csv_path, config["csv"],
@@ -62,7 +78,14 @@ def cmd_import(args) -> int:
                 print(f"  ... 还有 {len(result['errors']) - 10} 条错误")
         return 1
 
-    print(f"[OK] 导入成功")
+    batches_after = db.list_batches(db_path)
+    summary_after = db.get_summary(db_path)
+
+    untouched = all(b["id"] in batch_ids_before or b["id"] == result["batch_id"] for b in batches_after)
+    assert untouched, "导入过程不应修改旧批次 ID"
+    assert summary_before["batch_count"] <= summary_after["batch_count"], "批次数量不应减少"
+
+    print(f"[OK] 导入成功（方案切换不串改旧批次与汇总）")
     print(f"  批次 ID: {result['batch_id']}")
     print(f"  批次名称: {result['batch_name']}")
     print(f"  导入差异行: {result['imported']}")
@@ -81,23 +104,31 @@ def cmd_import(args) -> int:
 
 
 def cmd_list(args) -> int:
-    """列出差异命令."""
+    """列出差异命令（支持当前方案筛选 + 显式参数覆盖）."""
     config = _load_config(args)
     db_path = _get_db_path(config)
+    current_plan = _resolve_current_plan(config, db_path)
 
     status = getattr(args, "status", None)
     location = getattr(args, "location", None)
     sku = getattr(args, "sku", None)
 
+    filters = plans_mod.apply_plan_filters(current_plan, status, location, sku)
+
     diffs = merger.get_merged_differences(
-        db_path, status=status, location=location, sku=sku
+        db_path, status=filters["status"], location=filters["location"], sku=filters["sku"]
     )
 
     if not diffs:
         print("没有找到差异记录")
+        if current_plan:
+            print(f"  [使用方案: {current_plan['name']}]")
         return 0
 
-    print(f"共 {len(diffs)} 条差异:")
+    if current_plan:
+        print(f"[方案: {current_plan['name']}] 共 {len(diffs)} 条差异:")
+    else:
+        print(f"共 {len(diffs)} 条差异:")
     print("-" * 80)
     print(f"{'ID':<5} {'库位':<12} {'SKU':<15} {'差异数':>8} {'状态':<8} {'来源':>5} {'备注':<20}")
     print("-" * 80)
@@ -153,24 +184,35 @@ def cmd_show(args) -> int:
                 desc = "备注变更"
             else:
                 desc = action
-            print(f"  [{h['created_at']}] {desc} ({h['operator']})")
+            plan_part = f" [方案:{h.get('plan_name')}]" if h.get("plan_name") else ""
+            print(f"  [{h['created_at']}] {desc} ({h['operator']}){plan_part}")
 
     return 0
 
 
 def cmd_status(args) -> int:
-    """设置状态命令."""
+    """设置状态命令（记录当前方案和操作人）."""
     config = _load_config(args)
     db_path = _get_db_path(config)
+    current_plan = _resolve_current_plan(config, db_path)
 
     diff_ids = args.diff_ids
     status = args.status
     allowed = cfg.get_allowed_statuses(config)
+    operator = config.get("operator", "cli")
+    plan_id = current_plan["id"] if current_plan else None
+    plan_name = current_plan["name"] if current_plan else None
 
     if len(diff_ids) == 1:
-        result = reviewer.set_status(db_path, diff_ids[0], status, allowed_statuses=allowed)
+        result = reviewer.set_status(
+            db_path, diff_ids[0], status, operator=operator,
+            allowed_statuses=allowed, plan_id=plan_id, plan_name=plan_name,
+        )
     else:
-        result = reviewer.batch_set_status(db_path, diff_ids, status, allowed_statuses=allowed)
+        result = reviewer.batch_set_status(
+            db_path, diff_ids, status, operator=operator,
+            allowed_statuses=allowed, plan_id=plan_id, plan_name=plan_name,
+        )
 
     if not result.get("success"):
         print(f"[ERROR] {result.get('error', '操作失败')}")
@@ -191,19 +233,36 @@ def cmd_status(args) -> int:
         print(f"[OK] 状态已更新")
         print(f"  差异 #{result['diff_id']}: "
               f"{result['old_status']} -> {result['new_status']}")
-
+        if plan_name:
+            print(f"  方案: {plan_name}")
     return 0
 
 
 def cmd_remark(args) -> int:
-    """设置备注命令."""
+    """设置备注命令（记录当前方案和操作人，可套用备注模板）."""
     config = _load_config(args)
     db_path = _get_db_path(config)
+    current_plan = _resolve_current_plan(config, db_path)
 
     diff_id = args.diff_id
     remark = args.remark
 
-    result = reviewer.set_remark(db_path, diff_id, remark)
+    if current_plan and current_plan.get("remark_template") and "{diff_id}" in remark:
+        remark = remark.format(
+            diff_id=diff_id,
+            template=current_plan.get("remark_template", ""),
+        )
+    elif current_plan and current_plan.get("remark_template") and not remark:
+        remark = current_plan["remark_template"]
+
+    operator = config.get("operator", "cli")
+    plan_id = current_plan["id"] if current_plan else None
+    plan_name = current_plan["name"] if current_plan else None
+
+    result = reviewer.set_remark(
+        db_path, diff_id, remark, operator=operator,
+        plan_id=plan_id, plan_name=plan_name,
+    )
 
     if not result.get("success"):
         print(f"[ERROR] {result.get('error', '操作失败')}")
@@ -215,15 +274,25 @@ def cmd_remark(args) -> int:
 
     print(f"[OK] 备注已更新")
     print(f"  差异 #{result['diff_id']}")
+    if plan_name:
+        print(f"  方案: {plan_name}")
     return 0
 
 
 def cmd_undo(args) -> int:
-    """撤销命令."""
+    """撤销命令（记录当前方案和操作人）."""
     config = _load_config(args)
     db_path = _get_db_path(config)
+    current_plan = _resolve_current_plan(config, db_path)
 
-    result = reviewer.undo_last(db_path)
+    operator = config.get("operator", "cli")
+    plan_id = current_plan["id"] if current_plan else None
+    plan_name = current_plan["name"] if current_plan else None
+
+    result = reviewer.undo_last(
+        db_path, operator=operator,
+        plan_id=plan_id, plan_name=plan_name,
+    )
 
     if not result.get("success"):
         if result.get("empty_history"):
@@ -263,31 +332,42 @@ def cmd_history(args) -> int:
             desc = "备注变更"
         else:
             desc = action
+        plan_part = f" [方案:{h.get('plan_name')}]" if h.get("plan_name") else ""
         print(f"[{h['created_at']}] #{h['difference_id']} "
-              f"({h['location']}/{h['sku']}): {desc}")
+              f"({h['location']}/{h['sku']}): {desc} ({h['operator']}){plan_part}")
 
     return 0
 
 
 def cmd_export(args) -> int:
-    """导出命令."""
+    """导出命令（支持当前方案的导出字段和状态过滤）."""
     config = _load_config(args)
     db_path = _get_db_path(config)
+    current_plan = _resolve_current_plan(config, db_path)
 
     output_dir = os.path.abspath(config["export"]["output_dir"])
     status = getattr(args, "status", None)
-
     export_type = getattr(args, "type", "differences")
+    operator = config.get("operator", "cli")
+
+    filters = plans_mod.apply_plan_filters(current_plan, status, None, None)
+    effective_status = filters["status"]
 
     if export_type == "differences":
         result = exporter.export_differences(
-            db_path, output_dir, status=status, include_sources=True
+            db_path, output_dir, status=effective_status,
+            include_sources=True, plan=current_plan, operator=operator,
         )
     elif export_type == "summary":
-        result = exporter.export_summary(db_path, output_dir)
+        result = exporter.export_summary(
+            db_path, output_dir, plan=current_plan, operator=operator,
+        )
     elif export_type == "sources":
         batch_id = getattr(args, "batch_id", None)
-        result = exporter.export_source_lines(db_path, output_dir, batch_id=batch_id)
+        result = exporter.export_source_lines(
+            db_path, output_dir, batch_id=batch_id,
+            plan=current_plan, operator=operator,
+        )
     else:
         print(f"[ERROR] 未知导出类型: {export_type}")
         return 1
@@ -300,6 +380,8 @@ def cmd_export(args) -> int:
     print(f"  文件: {result['file_path']}")
     if "count" in result:
         print(f"  记录数: {result['count']}")
+    if result.get("plan_name"):
+        print(f"  方案: {result['plan_name']}")
     return 0
 
 
@@ -373,6 +455,171 @@ def cmd_remerge(args) -> int:
     return 0
 
 
+def cmd_plan_save(args) -> int:
+    """保存复核方案."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    status = getattr(args, "status", None)
+    location = getattr(args, "location", None)
+    sku = getattr(args, "sku", None)
+    export_fields = getattr(args, "fields", None)
+    if export_fields:
+        export_fields = [f.strip() for f in export_fields.split(",") if f.strip()]
+    remark_template = getattr(args, "remark_template", None)
+
+    result = plans_mod.save_plan(
+        db_path, config, name,
+        filter_status=status, filter_location=location, filter_sku=sku,
+        export_fields=export_fields, remark_template=remark_template,
+    )
+
+    print(f"[OK] 方案已保存: {name} (ID={result['plan_id']})")
+    if result["plan"].get("filter_status"):
+        print(f"  状态过滤: {result['plan']['filter_status']}")
+    if result["plan"].get("filter_location"):
+        print(f"  库位过滤: {result['plan']['filter_location']}")
+    if result["plan"].get("filter_sku"):
+        print(f"  SKU 过滤: {result['plan']['filter_sku']}")
+    if result["plan"].get("export_fields"):
+        print(f"  导出字段: {', '.join(result['plan']['export_fields'])}")
+    if result["plan"].get("remark_template"):
+        print(f"  备注模板: {result['plan']['remark_template']}")
+    return 0
+
+
+def cmd_plan_list(args) -> int:
+    """列出所有复核方案."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+
+    plans = plans_mod.list_plans(db_path)
+
+    if not plans:
+        print("暂无方案")
+        return 0
+
+    active = config.get("active_plan")
+    print(f"共 {len(plans)} 个方案（当前激活: {active or '(无)'}）:")
+    print("-" * 80)
+    print(f"{'ID':<4} {'名称':<20} {'状态过滤':<10} {'更新时间':<20}")
+    print("-" * 80)
+    for p in plans:
+        mark = "*" if p["name"] == active else " "
+        print(f"{mark}{p['id']:<3} {p['name']:<20} "
+              f"{(p.get('filter_status') or '-'):<10} "
+              f"{p.get('updated_at', ''):<20}")
+    return 0
+
+
+def cmd_plan_use(args) -> int:
+    """激活指定方案（重启后续用）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+
+    name = args.name
+    if name is None:
+        cfg.set_active_plan(config, None)
+        print("[OK] 已清除激活方案")
+        return 0
+
+    plan = plans_mod.get_plan(db_path, config, name)
+    if not plan:
+        print(f"[ERROR] 方案不存在: {name}")
+        return 1
+
+    cfg.set_active_plan(config, name)
+    print(f"[OK] 已激活方案: {name}（重启后仍然生效）")
+    return 0
+
+
+def cmd_plan_delete(args) -> int:
+    """删除方案."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+
+    name = args.name
+    ok = plans_mod.delete_plan(db_path, config, name)
+    if not ok:
+        print(f"[WARN] 方案不存在或删除失败: {name}")
+        return 0
+
+    if config.get("active_plan") == name:
+        cfg.set_active_plan(config, None)
+        print(f"[OK] 方案 {name} 已删除（同时清除激活）")
+    else:
+        print(f"[OK] 方案 {name} 已删除")
+    return 0
+
+
+def cmd_set_operator(args) -> int:
+    """设置操作人（重启后续用）."""
+    config = _load_config(args)
+    operator = args.operator
+    cfg.set_operator(config, operator)
+    print(f"[OK] 操作人已设为: {operator}（重启后仍然生效）")
+    return 0
+
+
+def cmd_replay(args) -> int:
+    """回放操作日志（带冲突检测）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    output_dir = os.path.abspath(config["export"]["output_dir"])
+    allowed = cfg.get_allowed_statuses(config)
+
+    plan_name = getattr(args, "plan", None)
+    operator = getattr(args, "operator", None)
+    resolution = getattr(args, "resolution", "abort")
+    action_types_raw = getattr(args, "action_types", None)
+    action_types = None
+    if action_types_raw:
+        action_types = [a.strip() for a in action_types_raw.split(",") if a.strip()]
+
+    plan_id = None
+    if plan_name:
+        plan = plans_mod.get_plan(db_path, config, plan_name)
+        if not plan:
+            print(f"[ERROR] 方案不存在: {plan_name}")
+            return 1
+        plan_id = plan["id"]
+
+    result = replay_mod.replay_operations(
+        db_path, output_dir,
+        plan_id=plan_id, plan_name=plan_name, operator=operator,
+        allowed_statuses=allowed,
+        default_conflict_resolution=resolution,
+        action_types=action_types,
+    )
+
+    if not result["success"] and result.get("aborted"):
+        c = result["aborted"]
+        print(f"[ABORT] 回放因冲突中止：{c['message']}")
+        print(f"  日志 ID: {c['log_id']}")
+        print(f"  原因: {c['reason']}")
+        if len(result["replayed"]) > 0:
+            print(f"  已成功回放: {len(result['replayed'])} 条")
+        return 2
+
+    print(f"[OK] 回放完成")
+    print(f"  成功: {len(result['replayed'])} 条")
+    if result["conflicts"]:
+        print(f"  冲突: {len(result['conflicts'])} 条")
+        for c in result["conflicts"]:
+            print(f"    - log#{c['log_id']}: {c['message']}")
+    if result["skipped"]:
+        print(f"  跳过: {len(result['skipped'])} 条")
+    if result["exports"]:
+        print(f"  重新导出: {len(result['exports'])} 份")
+        for e in result["exports"]:
+            print(f"    - {e.get('file_path')}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器."""
     parser = argparse.ArgumentParser(
@@ -387,77 +634,106 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", help="可用命令")
 
-    # init
     p_init = subparsers.add_parser("init", help="初始化数据库和目录")
     p_init.set_defaults(func=cmd_init)
 
-    # import
     p_import = subparsers.add_parser("import", help="导入盘点 CSV")
     p_import.add_argument("csv_file", help="CSV 文件路径")
     p_import.add_argument("-n", "--name", help="批次名称", default=None)
     p_import.set_defaults(func=cmd_import)
 
-    # list
-    p_list = subparsers.add_parser("list", help="列出差异")
-    p_list.add_argument("-s", "--status", help="按状态过滤", default=None)
-    p_list.add_argument("-l", "--location", help="按库位过滤", default=None)
-    p_list.add_argument("--sku", help="按 SKU 过滤", default=None)
+    p_list = subparsers.add_parser("list", help="列出差异（支持方案筛选）")
+    p_list.add_argument("-s", "--status", help="按状态过滤（覆盖方案）", default=None)
+    p_list.add_argument("-l", "--location", help="按库位过滤（覆盖方案）", default=None)
+    p_list.add_argument("--sku", help="按 SKU 过滤（覆盖方案）", default=None)
     p_list.set_defaults(func=cmd_list)
 
-    # show
     p_show = subparsers.add_parser("show", help="查看差异详情")
     p_show.add_argument("diff_id", type=int, help="差异 ID")
     p_show.set_defaults(func=cmd_show)
 
-    # status
-    p_status = subparsers.add_parser("status", help="设置差异状态")
+    p_status = subparsers.add_parser("status", help="设置差异状态（记录当前方案）")
     p_status.add_argument("diff_ids", type=int, nargs="+", help="差异 ID（可多个）")
-    p_status.add_argument(
-        "status",
-        help="状态值 (由配置 status.allowed 决定合法值)",
-    )
+    p_status.add_argument("status", help="状态值 (由配置 status.allowed 决定合法值)")
     p_status.set_defaults(func=cmd_status)
 
-    # remark
-    p_remark = subparsers.add_parser("remark", help="设置差异备注")
+    p_remark = subparsers.add_parser("remark", help="设置差异备注（支持方案备注模板）")
     p_remark.add_argument("diff_id", type=int, help="差异 ID")
     p_remark.add_argument("remark", help="备注内容")
     p_remark.set_defaults(func=cmd_remark)
 
-    # undo
     p_undo = subparsers.add_parser("undo", help="撤销最后一次复核操作")
     p_undo.set_defaults(func=cmd_undo)
 
-    # history
     p_history = subparsers.add_parser("history", help="查看复核历史")
     p_history.add_argument("-d", "--diff-id", type=int, help="指定差异 ID", default=None)
     p_history.add_argument("-n", "--limit", type=int, help="显示条数", default=20)
     p_history.set_defaults(func=cmd_history)
 
-    # export
-    p_export = subparsers.add_parser("export", help="导出报告")
+    p_export = subparsers.add_parser("export", help="导出报告（支持方案字段）")
     p_export.add_argument(
         "-t", "--type",
         choices=["differences", "summary", "sources"],
         default="differences",
         help="导出类型: differences(差异明细), summary(汇总), sources(来源行)",
     )
-    p_export.add_argument("-s", "--status", help="按状态过滤", default=None)
+    p_export.add_argument("-s", "--status", help="按状态过滤（覆盖方案）", default=None)
     p_export.add_argument("-b", "--batch-id", type=int, help="批次 ID (sources 类型)", default=None)
     p_export.set_defaults(func=cmd_export)
 
-    # batches
     p_batches = subparsers.add_parser("batches", help="查看批次列表")
     p_batches.set_defaults(func=cmd_batches)
 
-    # summary
     p_summary = subparsers.add_parser("summary", help="查看汇总统计")
     p_summary.set_defaults(func=cmd_summary)
 
-    # remerge
     p_remerge = subparsers.add_parser("remerge", help="重新合并差异（数据修复用）")
     p_remerge.add_argument("-f", "--force", action="store_true", help="跳过确认")
     p_remerge.set_defaults(func=cmd_remerge)
+
+    p_operator = subparsers.add_parser("set-operator", help="设置操作人（重启后续用）")
+    p_operator.add_argument("operator", help="操作人名称")
+    p_operator.set_defaults(func=cmd_set_operator)
+
+    p_plan_save = subparsers.add_parser("plan-save", help="保存复核方案（筛选/导出字段/备注模板）")
+    p_plan_save.add_argument("name", help="方案名称（唯一）")
+    p_plan_save.add_argument("-s", "--status", help="状态过滤", default=None)
+    p_plan_save.add_argument("-l", "--location", help="库位过滤", default=None)
+    p_plan_save.add_argument("--sku", help="SKU 过滤", default=None)
+    p_plan_save.add_argument(
+        "-f", "--fields",
+        help="导出字段（逗号分隔，如 id,location,sku,total_diff_qty,status,remark）",
+        default=None,
+    )
+    p_plan_save.add_argument("-r", "--remark-template", help="备注模板", default=None)
+    p_plan_save.set_defaults(func=cmd_plan_save)
+
+    p_plan_list = subparsers.add_parser("plan-list", help="列出所有复核方案")
+    p_plan_list.set_defaults(func=cmd_plan_list)
+
+    p_plan_use = subparsers.add_parser("plan-use", help="激活方案（重启后续用），不带参数则清除")
+    p_plan_use.add_argument("name", nargs="?", help="方案名称")
+    p_plan_use.set_defaults(func=cmd_plan_use)
+
+    p_plan_delete = subparsers.add_parser("plan-delete", help="删除复核方案")
+    p_plan_delete.add_argument("name", help="方案名称")
+    p_plan_delete.set_defaults(func=cmd_plan_delete)
+
+    p_replay = subparsers.add_parser("replay", help="按操作日志回放（含冲突检测）")
+    p_replay.add_argument("-p", "--plan", help="按方案过滤回放日志", default=None)
+    p_replay.add_argument("-o", "--operator", help="按操作人过滤回放日志", default=None)
+    p_replay.add_argument(
+        "-r", "--resolution",
+        choices=["keep", "snapshot", "abort"],
+        default="abort",
+        help="冲突处理策略: keep(保留当前), snapshot(另存快照后跳过), abort(中止,默认)",
+    )
+    p_replay.add_argument(
+        "-a", "--action-types",
+        default=None,
+        help="只回放指定动作类型（逗号分隔）, 如: status_change,remark_change,export,undo",
+    )
+    p_replay.set_defaults(func=cmd_replay)
 
     return parser
 

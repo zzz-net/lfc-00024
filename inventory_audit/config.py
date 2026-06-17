@@ -2,7 +2,7 @@
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -28,11 +28,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "export": {
         "output_dir": "./audit_data/exports",
     },
+    "active_plan": None,
+    "operator": "cli",
 }
 
 
+def _state_file_path(config: Dict[str, Any]) -> str:
+    """运行时状态文件路径（与数据库同目录，保存 active_plan / operator）."""
+    db_dir = os.path.dirname(os.path.abspath(config["database"]["path"]))
+    return os.path.join(db_dir, "runtime_state.json")
+
+
 def load_config(config_path: str = None) -> Dict[str, Any]:
-    """加载配置文件，不存在则返回默认配置.
+    """加载配置文件，不存在则返回默认配置，并合并运行时状态（active_plan/operator）.
 
     Args:
         config_path: 配置文件路径，支持 JSON 格式
@@ -47,7 +55,46 @@ def load_config(config_path: str = None) -> Dict[str, Any]:
             user_config = json.load(f)
         _deep_merge(config, user_config)
 
+    try:
+        state_path = _state_file_path(config)
+        if os.path.exists(state_path):
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            if "active_plan" in state:
+                config["active_plan"] = state["active_plan"]
+            if "operator" in state:
+                config["operator"] = state["operator"]
+    except (OSError, json.JSONDecodeError):
+        pass
+
     return config
+
+
+def save_runtime_state(config: Dict[str, Any]) -> None:
+    """将 active_plan / operator 落盘，确保重启后续用."""
+    try:
+        state_path = _state_file_path(config)
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        state = {
+            "active_plan": config.get("active_plan"),
+            "operator": config.get("operator", "cli"),
+        }
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def set_active_plan(config: Dict[str, Any], plan_name: Optional[str]) -> None:
+    """设置当前方案并立即落盘."""
+    config["active_plan"] = plan_name
+    save_runtime_state(config)
+
+
+def set_operator(config: Dict[str, Any], operator: str) -> None:
+    """设置操作人并立即落盘."""
+    config["operator"] = operator
+    save_runtime_state(config)
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> None:
