@@ -5,16 +5,17 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
+from . import archive as archive_mod
+from . import batch as batch_mod
 from . import config as cfg
 from . import db
+from . import exporter
 from . import importer
 from . import merger
 from . import plans as plans_mod
 from . import replay as replay_mod
 from . import reviewer
-from . import exporter
 from . import templates as templates_mod
-from . import batch as batch_mod
 
 
 def _load_config(args) -> Dict[str, Any]:
@@ -775,10 +776,13 @@ def cmd_template_show(args) -> int:
     if execs:
         print(f"\n执行记录 ({len(execs)} 条):")
         for e in execs:
+            op_part = f" op={e.get('operator') or '-'}"
+            plan_part = f" plan={e.get('active_plan') or '-'}"
             print(f"  #{e['id']} v{e.get('template_version')} "
                   f"{e.get('status')} "
                   f"完成 {e.get('steps_done')}/{e.get('steps_total')} "
-                  f"失败 {e.get('steps_failed')}")
+                  f"失败 {e.get('steps_failed')}"
+                  f"{op_part}{plan_part}")
     return 0
 
 
@@ -894,9 +898,102 @@ def cmd_template_run(args) -> int:
         else:
             print(f"  #{s['step_index']} {label}: 失败 - {s.get('error')}")
 
+    if result.get("archive_path"):
+        print(f"\n[归档] 执行清单已导出: {result['archive_path']}")
+
     if status != "completed":
         print(f"\n[提示] 使用 'template-run {name} --resume' 续跑（已完成步骤不会重复执行）")
         return 2
+    return 0
+
+
+def cmd_template_export_execution(args) -> int:
+    """导出执行归档清单（含模板快照、步骤结果、operator、激活方案）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    execution_id = getattr(args, "execution_id", None)
+    if execution_id is None:
+        name = getattr(args, "name", None)
+        if not name:
+            print("[ERROR] 请指定 --execution-id 或模板名称")
+            return 1
+        template = templates_mod.get_template(db_path, config, name)
+        if not template:
+            print(f"[ERROR] 模板不存在：{name}")
+            return 1
+        execs = db.list_executions(db_path, template_id=template["id"])
+        if not execs:
+            print(f"[ERROR] 模板 {name} 没有执行记录")
+            return 1
+        execution_id = execs[0]["id"]
+        print(f"[INFO] 选择最近执行记录 #{execution_id}")
+
+    output = getattr(args, "output", None)
+    result = archive_mod.export_execution_manifest(
+        db_path, config, execution_id, output_path=output,
+    )
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error')}")
+        return 1
+    print(f"[OK] 执行归档已导出")
+    print(f"  文件: {result['file_path']}")
+    manifest = result.get("manifest", {})
+    meta = manifest.get("execution_meta", {})
+    print(f"  执行 #{meta.get('execution_id')}: {meta.get('template_name')} "
+          f"v{meta.get('template_version')} {meta.get('status')}")
+    print(f"  步骤: 完成 {meta.get('steps_done')}/{meta.get('steps_total')} "
+          f"失败 {meta.get('steps_failed')}")
+    print(f"  操作人: {meta.get('operator') or '-'}，激活方案: {meta.get('active_plan') or '-'}")
+    export_count = len(manifest.get("export_files", []))
+    if export_count:
+        print(f"  相关导出文件: {export_count} 个")
+    return 0
+
+
+def cmd_template_restore_execution(args) -> int:
+    """从归档清单恢复执行历史（支持冲突检测与处理）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    manifest_file = args.file
+    resolution = getattr(args, "conflict", "abort")
+
+    result = archive_mod.restore_execution_from_manifest(
+        db_path, config, manifest_file, conflict_resolution=resolution,
+    )
+
+    if not result.get("success"):
+        if result.get("conflicts"):
+            print("[冲突] 恢复前检测到以下问题：")
+            for c in result["conflicts"]:
+                print(f"  [{c.get('type')}] {c.get('message')}")
+        err = result.get("error") or "恢复失败"
+        if result.get("template_conflict"):
+            print(f"[冲突] {err}")
+            print("  使用 --conflict save-as 另存为新模板名后恢复")
+        else:
+            print(f"[ERROR] {err}")
+        return 1
+
+    if result.get("conflicts"):
+        print("[提示] 恢复时检测到非阻塞冲突：")
+        for c in result["conflicts"]:
+            print(f"  [{c.get('type')}] {c.get('message')}")
+
+    tpl = result.get("template") or {}
+    print(f"[OK] 执行历史已恢复")
+    print(f"  新执行 ID: #{result['execution_id']} "
+          f"(原归档 #{result.get('original_execution_id')})")
+    action = result.get("template_action", "")
+    name_note = ""
+    if action == "save_as":
+        name_note = f" (另存为 {result.get('name')})"
+    print(f"  模板: {tpl.get('name')} v{tpl.get('version')}{name_note}")
+    print(f"  步骤数: {result.get('steps_restored', 0)}")
+    print(f"  操作人: {config.get('operator', 'cli')}")
     return 0
 
 
@@ -1079,6 +1176,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume", action="store_true", help="续跑最近一次未完成的执行",
     )
     p_tpl_run.set_defaults(func=cmd_template_run)
+
+    p_tpl_export_exec = subparsers.add_parser(
+        "template-export-execution",
+        help="导出执行归档清单（含模板快照、步骤结果、operator、激活方案）",
+    )
+    p_tpl_export_exec.add_argument(
+        "name", nargs="?", default=None, help="模板名称（取最近执行）",
+    )
+    p_tpl_export_exec.add_argument(
+        "-e", "--execution-id", type=int, default=None, help="指定执行记录 ID（优先于模板名）",
+    )
+    p_tpl_export_exec.add_argument(
+        "-o", "--output", default=None, help="输出文件路径(JSON)，默认 archives/ 目录",
+    )
+    p_tpl_export_exec.set_defaults(func=cmd_template_export_execution)
+
+    p_tpl_restore_exec = subparsers.add_parser(
+        "template-restore-execution",
+        help="从归档清单恢复执行历史（支持冲突检测与处理）",
+    )
+    p_tpl_restore_exec.add_argument("file", help="归档清单文件路径(JSON)")
+    p_tpl_restore_exec.add_argument(
+        "--conflict", choices=["abort", "save-as"], default="abort",
+        help="冲突处理策略：abort(中止,默认) / save-as(另存为新模板名)",
+    )
+    p_tpl_restore_exec.set_defaults(func=cmd_template_restore_execution)
 
     return parser
 

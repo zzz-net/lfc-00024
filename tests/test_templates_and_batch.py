@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import unittest
 
+from inventory_audit import archive as archive_mod
 from inventory_audit import batch as batch_mod
 from inventory_audit import cli
 from inventory_audit import config as cfg
@@ -745,6 +746,616 @@ class TestBOMCompatibility(_BaseTest):
         self.assertIsNotNone(t)
         self.assertEqual(t["description"], "全链路 BOM 测试模板")
         self.assertEqual(len(t["steps"]), 2)
+
+
+class TestExecutionArchiveExport(_BaseTest):
+    """执行归档导出：template-run 完成/中断后自动导出，内容完整."""
+
+    def test_auto_archive_on_completed_execution(self):
+        """执行成功后自动生成归档文件."""
+        self._import(self._make_batch())
+        self._save_template(
+            "ARC_CMP",
+            steps=[
+                {"action": "list"},
+                {"action": "export", "type": "summary"},
+            ],
+        )
+        template = templates_mod.get_template(self.db_path, self.config, "ARC_CMP")
+        allowed = cfg.get_allowed_statuses(self.config)
+        result = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed, operator="tester_alice",
+        )
+        self.assertTrue(result["success"])
+        self.assertIsNotNone(result.get("archive_path"), "执行成功后应自动导出归档")
+        self.assertTrue(os.path.exists(result["archive_path"]))
+
+    def test_auto_archive_on_interrupted_execution(self):
+        """执行中断后也自动生成归档文件."""
+        self._save_template(
+            "ARC_INT",
+            steps=[
+                {"action": "export", "type": "summary"},
+                {"action": "export", "type": "differences"},
+            ],
+        )
+        template = templates_mod.get_template(self.db_path, self.config, "ARC_INT")
+        allowed = cfg.get_allowed_statuses(self.config)
+        result = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed, operator="tester_bob",
+        )
+        self.assertFalse(result["success"])
+        self.assertIsNotNone(result.get("archive_path"), "中断后也应导出归档")
+        self.assertTrue(os.path.exists(result["archive_path"]))
+
+    def test_manifest_contains_required_fields(self):
+        """归档清单包含：模板快照、步骤结果、operator、激活方案、导出文件、配置摘要."""
+        cfg.set_active_plan(self.config, "test_plan_A")
+        cfg.set_operator(self.config, "op_chen")
+        cfg.save_runtime_state(self.config)
+        self._import(self._make_batch())
+        self._save_template(
+            "ARC_FLD",
+            steps=[
+                {"action": "list"},
+                {"action": "export", "type": "summary"},
+                {"action": "export", "type": "differences"},
+            ],
+            export_fields=["id", "location", "sku", "status"],
+        )
+        template = templates_mod.get_template(self.db_path, self.config, "ARC_FLD")
+        allowed = cfg.get_allowed_statuses(self.config)
+        result = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        self.assertTrue(result["success"])
+
+        with open(result["archive_path"], "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        self.assertEqual(manifest["$schema"], "inventory_audit_execution_manifest")
+        self.assertEqual(manifest["$manifest_version"], 1)
+
+        snap = manifest["template_snapshot"]
+        self.assertEqual(snap["name"], "ARC_FLD")
+        self.assertEqual(snap["version"], 1)
+        self.assertIn("filters", snap)
+        self.assertIn("steps", snap)
+        self.assertIn("content_hash", snap)
+        self.assertEqual(snap["export_fields"], ["id", "location", "sku", "status"])
+
+        meta = manifest["execution_meta"]
+        self.assertEqual(meta["template_name"], "ARC_FLD")
+        self.assertEqual(meta["template_version"], 1)
+        self.assertEqual(meta["status"], "completed")
+        self.assertEqual(meta["operator"], "op_chen")
+        self.assertEqual(meta["active_plan"], "test_plan_A")
+        self.assertEqual(meta["steps_done"], 3)
+        self.assertEqual(meta["steps_failed"], 0)
+
+        self.assertEqual(manifest["operator"], "op_chen")
+        self.assertEqual(manifest["active_plan"], "test_plan_A")
+
+        self.assertEqual(len(manifest["steps"]), 3)
+        self.assertEqual(manifest["steps"][0]["status"], "done")
+        self.assertIsNotNone(manifest["steps"][0].get("result"))
+
+        export_files = manifest["export_files"]
+        self.assertGreaterEqual(len(export_files), 2)
+        for ef in export_files:
+            self.assertIn("file_path", ef)
+            self.assertIn("template_name", ef)
+            self.assertIn("template_version", ef)
+            self.assertTrue(ef["file_exists"])
+
+        cfg_sum = manifest["config_summary"]
+        self.assertIn("csv_columns", cfg_sum)
+        self.assertIn("status_allowed", cfg_sum)
+        self.assertIn("merge_keys", cfg_sum)
+        self.assertIn("export_output_dir", cfg_sum)
+
+        self.assertGreaterEqual(len(manifest["operation_logs"]), 2)
+
+    def test_explicit_export_execution_via_function(self):
+        """显式调用 export_execution_manifest 导出指定 execution."""
+        self._import(self._make_batch())
+        self._save_template("ARC_EXP", steps=[{"action": "export", "type": "summary"}])
+        template = templates_mod.get_template(self.db_path, self.config, "ARC_EXP")
+        allowed = cfg.get_allowed_statuses(self.config)
+        r = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed, auto_archive=False,
+        )
+        eid = r["execution_id"]
+
+        out_path = os.path.join(self.tmpdir, "my_manifest.json")
+        result = archive_mod.export_execution_manifest(
+            self.db_path, self.config, eid, output_path=out_path,
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(os.path.abspath(out_path), result["file_path"])
+        self.assertTrue(os.path.exists(out_path))
+
+        bad_result = archive_mod.export_execution_manifest(
+            self.db_path, self.config, 99999,
+        )
+        self.assertFalse(bad_result["success"])
+
+
+class TestExecutionArchiveRestore(_BaseTest):
+    """从归档清单恢复执行历史：DB 丢失后恢复，template-show/--resume 正常."""
+
+    def _setup_and_archive(self, template_name="ARC_RES", steps=None, operator="resume_op"):
+        if steps is None:
+            steps = [
+                {"action": "export", "type": "summary"},
+                {"action": "export", "type": "differences"},
+            ]
+        self._import(self._make_batch())
+        cfg.set_operator(self.config, operator)
+        cfg.save_runtime_state(self.config)
+        self._save_template(template_name, steps=steps, description="归档恢复测试")
+        template = templates_mod.get_template(self.db_path, self.config, template_name)
+        allowed = cfg.get_allowed_statuses(self.config)
+        result = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        manifest_path = result["archive_path"]
+        self.assertIsNotNone(manifest_path)
+        return result, manifest_path
+
+    def test_restore_to_fresh_db(self):
+        """删除 DB 后，从归档清单恢复模板和执行记录."""
+        run_result, manifest_path = self._setup_and_archive()
+        eid_orig = run_result["execution_id"]
+
+        templates_dir = os.path.join(os.path.dirname(self.db_path), "templates")
+        os.remove(self.db_path)
+        if os.path.isdir(templates_dir):
+            shutil.rmtree(templates_dir)
+        db.init_db(self.db_path)
+
+        self.assertIsNone(db.get_template(self.db_path, "ARC_RES"))
+        self.assertEqual(db.list_executions(self.db_path), [])
+
+        restore_result = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path,
+        )
+        self.assertTrue(restore_result["success"], f"恢复失败: {restore_result.get('error')}")
+
+        restored_tpl = templates_mod.get_template(self.db_path, self.config, "ARC_RES")
+        self.assertIsNotNone(restored_tpl)
+        self.assertEqual(restored_tpl["name"], "ARC_RES")
+        self.assertEqual(restored_tpl["description"], "归档恢复测试")
+        self.assertEqual(restored_tpl["version"], 1)
+
+        new_eid = restore_result["execution_id"]
+        execution = db.get_execution(self.db_path, new_eid)
+        self.assertIsNotNone(execution)
+        self.assertEqual(execution["template_name"], "ARC_RES")
+        self.assertEqual(execution["template_version"], 1)
+        self.assertEqual(execution["operator"], "resume_op")
+        self.assertEqual(execution["status"], "completed")
+        self.assertEqual(execution["steps_done"], 2)
+
+        steps = db.get_steps(self.db_path, new_eid)
+        self.assertEqual(len(steps), 2)
+        self.assertEqual(steps[0]["status"], "done")
+        self.assertEqual(steps[1]["status"], "done")
+
+    def test_template_show_after_restore(self):
+        """恢复后 template-show 能看到模板和执行记录."""
+        _, manifest_path = self._setup_and_archive("SHOW_RES")
+        os.remove(self.db_path)
+        db.init_db(self.db_path)
+
+        archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path,
+        )
+
+        rc = self._run_cli("template-show", "SHOW_RES")
+        self.assertEqual(rc, 0)
+
+    def test_resume_after_restore_interrupted(self):
+        """恢复中断的执行后，template-run --resume 能接着跑."""
+        self._save_template(
+            "RESUME_RESTORE",
+            steps=[
+                {"action": "export", "type": "summary"},
+                {"action": "export", "type": "differences"},
+            ],
+        )
+        template = templates_mod.get_template(self.db_path, self.config, "RESUME_RESTORE")
+        allowed = cfg.get_allowed_statuses(self.config)
+
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed, auto_archive=True,
+        )
+        self.assertFalse(r1["success"])
+        self.assertEqual(r1["steps_done"], 1)
+        self.assertEqual(r1["steps_failed"], 1)
+        manifest_path = r1["archive_path"]
+
+        os.remove(self.db_path)
+        db.init_db(self.db_path)
+        self.assertFalse(os.path.exists(self.db_path.replace(".db", "_notexist.db")))
+
+        restore_result = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path,
+        )
+        self.assertTrue(restore_result["success"])
+
+        self._import(self._make_batch("after_restore"))
+
+        rc = self._run_cli("template-run", "RESUME_RESTORE", "--resume")
+        self.assertEqual(rc, 0)
+
+        new_tpl = templates_mod.get_template(self.db_path, self.config, "RESUME_RESTORE")
+        execs = db.list_executions(self.db_path, template_id=new_tpl["id"])
+        self.assertEqual(len(execs), 1)
+        self.assertEqual(execs[0]["status"], "completed")
+        self.assertEqual(execs[0]["steps_done"], 2)
+        self.assertEqual(execs[0]["steps_failed"], 0)
+
+    def test_restore_metadata_alignment(self):
+        """恢复后导出的 summary/differences 文件命名、模板版本、日志与原执行一致."""
+        self._import(self._make_batch("meta"))
+        self._save_template(
+            "META_RES",
+            steps=[
+                {"action": "export", "type": "summary"},
+                {"action": "export", "type": "differences"},
+            ],
+            export_fields=["id", "location", "sku", "status"],
+            description="元数据一致性测试",
+        )
+        template = templates_mod.get_template(self.db_path, self.config, "META_RES")
+        tpl_id_orig = template["id"]
+        tpl_ver_orig = template["version"]
+        allowed = cfg.get_allowed_statuses(self.config)
+
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        manifest_path = r1["archive_path"]
+        orig_files = set(os.listdir(self.output_dir))
+        orig_export_logs = db.get_operation_logs(self.db_path, action_type="export")
+
+        os.remove(self.db_path)
+        db.init_db(self.db_path)
+
+        restore_result = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path,
+        )
+        self.assertTrue(restore_result["success"])
+
+        restored_tpl = templates_mod.get_template(self.db_path, self.config, "META_RES")
+        self.assertEqual(restored_tpl["version"], tpl_ver_orig)
+        self.assertEqual(restored_tpl["description"], "元数据一致性测试")
+        self.assertEqual(restored_tpl["export_fields"], ["id", "location", "sku", "status"])
+
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        for ef in manifest["export_files"]:
+            self.assertIn(ef["filename"], orig_files)
+            self.assertEqual(ef["template_name"], "META_RES")
+            self.assertEqual(ef["template_version"], tpl_ver_orig)
+
+        self.assertEqual(len(orig_export_logs), 2)
+        for log in orig_export_logs:
+            ad = log["action_data"]
+            self.assertEqual(ad["template_name"], "META_RES")
+            self.assertEqual(ad["template_version"], tpl_ver_orig)
+            self.assertEqual(ad["template_id"], tpl_id_orig)
+
+        new_eid = restore_result["execution_id"]
+        steps = db.get_steps(self.db_path, new_eid)
+        for sr in steps:
+            res = sr.get("result") or {}
+            if res.get("template_name"):
+                self.assertEqual(res["template_name"], "META_RES")
+                self.assertEqual(res["template_version"], tpl_ver_orig)
+
+    def test_restore_corrupt_manifest_rejected(self):
+        """损坏的归档文件应被拒绝，不污染数据库."""
+        bad_path = os.path.join(self.tmpdir, "bad_manifest.json")
+        with open(bad_path, "w", encoding="utf-8") as f:
+            json.dump({"$schema": "wrong_schema", "data": "nope"}, f)
+
+        result = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, bad_path,
+        )
+        self.assertFalse(result["success"])
+        self.assertIn("schema", result.get("error", ""))
+
+        missing = os.path.join(self.tmpdir, "no_such_file.json")
+        result2 = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, missing,
+        )
+        self.assertFalse(result2["success"])
+
+
+class TestArchiveConflictResolution(_BaseTest):
+    """冲突检测与处理：模板升级、导出文件存在、激活方案不一致."""
+
+    def test_detect_template_upgraded_conflict(self):
+        """同名模板已升级（版本或内容不同）时检测到冲突."""
+        self._import(self._make_batch())
+        self._save_template("CON_TPL", steps=[{"action": "export", "type": "summary"}],
+                            description="v1")
+        template = templates_mod.get_template(self.db_path, self.config, "CON_TPL")
+        allowed = cfg.get_allowed_statuses(self.config)
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        manifest_path = r1["archive_path"]
+
+        self._save_template("CON_TPL", steps=[{"action": "export", "type": "differences"}],
+                            description="v2", force=True)
+        v2 = templates_mod.get_template(self.db_path, self.config, "CON_TPL")
+        self.assertEqual(v2["version"], 2)
+
+        conflicts = archive_mod.detect_restore_conflicts(
+            self.db_path, self.config,
+            archive_mod.load_manifest(manifest_path)["manifest"],
+        )
+        conflict_types = [c["type"] for c in conflicts]
+        self.assertIn("template_upgraded", conflict_types)
+
+    def test_detect_export_file_exists_conflict(self):
+        """归档中记录的导出文件已存在时检测到冲突."""
+        self._import(self._make_batch())
+        self._save_template("CON_FILE", steps=[{"action": "export", "type": "summary"}])
+        template = templates_mod.get_template(self.db_path, self.config, "CON_FILE")
+        allowed = cfg.get_allowed_statuses(self.config)
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        manifest_path = r1["archive_path"]
+
+        conflicts = archive_mod.detect_restore_conflicts(
+            self.db_path, self.config,
+            archive_mod.load_manifest(manifest_path)["manifest"],
+        )
+        conflict_types = [c["type"] for c in conflicts]
+        self.assertIn("export_file_exists", conflict_types)
+
+    def test_detect_active_plan_mismatch(self):
+        """当前激活方案与归档记录不一致时检测到冲突."""
+        cfg.set_active_plan(self.config, "plan_old")
+        cfg.save_runtime_state(self.config)
+        self._import(self._make_batch())
+        self._save_template("CON_PLAN", steps=[{"action": "export", "type": "summary"}])
+        template = templates_mod.get_template(self.db_path, self.config, "CON_PLAN")
+        allowed = cfg.get_allowed_statuses(self.config)
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        manifest_path = r1["archive_path"]
+
+        cfg.set_active_plan(self.config, "plan_new")
+        cfg.save_runtime_state(self.config)
+
+        conflicts = archive_mod.detect_restore_conflicts(
+            self.db_path, self.config,
+            archive_mod.load_manifest(manifest_path)["manifest"],
+        )
+        conflict_types = [c["type"] for c in conflicts]
+        self.assertIn("active_plan_mismatch", conflict_types)
+
+    def test_conflict_abort_on_template_upgrade(self):
+        """模板升级冲突时 abort 策略直接中止恢复."""
+        self._import(self._make_batch())
+        self._save_template("CON_ABORT", steps=[{"action": "export", "type": "summary"}],
+                            description="v1")
+        template = templates_mod.get_template(self.db_path, self.config, "CON_ABORT")
+        allowed = cfg.get_allowed_statuses(self.config)
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        manifest_path = r1["archive_path"]
+
+        self._save_template("CON_ABORT", steps=[{"action": "list"}],
+                            description="v2", force=True)
+
+        result = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path, conflict_resolution="abort",
+        )
+        self.assertFalse(result["success"])
+        self.assertTrue(result.get("conflict"))
+        self.assertIsNotNone(result.get("conflicts"))
+
+    def test_conflict_save_as_on_template_upgrade(self):
+        """模板升级冲突时 save-as 策略另存为 <name>_restored."""
+        self._import(self._make_batch())
+        self._save_template("CON_SAVEAS", steps=[{"action": "export", "type": "summary"}],
+                            description="orig v1")
+        template = templates_mod.get_template(self.db_path, self.config, "CON_SAVEAS")
+        allowed = cfg.get_allowed_statuses(self.config)
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        manifest_path = r1["archive_path"]
+
+        self._save_template("CON_SAVEAS", steps=[{"action": "list"}],
+                            description="upgraded v2", force=True)
+
+        result = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path, conflict_resolution="save-as",
+        )
+        self.assertTrue(result["success"], f"save-as 应成功: {result.get('error')}")
+        self.assertEqual(result.get("template_action"), "save_as")
+
+        restored_name = result.get("name")
+        self.assertTrue(restored_name.startswith("CON_SAVEAS_restored"))
+
+        v2 = templates_mod.get_template(self.db_path, self.config, "CON_SAVEAS")
+        self.assertEqual(v2["version"], 2)
+        self.assertEqual(v2["description"], "upgraded v2")
+
+        restored = templates_mod.get_template(self.db_path, self.config, restored_name)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored["version"], 1)
+        self.assertIn("orig v1", restored.get("description", ""))
+
+    def test_save_as_handles_name_collision(self):
+        """多次 save-as 时 _restored, _restored1, _restored2 避免重名."""
+        self._import(self._make_batch())
+        self._save_template("COL", steps=[{"action": "export", "type": "summary"}],
+                            description="v1")
+        template = templates_mod.get_template(self.db_path, self.config, "COL")
+        allowed = cfg.get_allowed_statuses(self.config)
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        manifest_path = r1["archive_path"]
+
+        self._save_template("COL", steps=[{"action": "list"}], force=True)
+        templates_mod.save_template(
+            self.db_path, self.config, "COL_restored",
+            steps=[{"action": "list"}], description="占位",
+        )
+
+        result = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path, conflict_resolution="save-as",
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["name"], "COL_restored1")
+
+
+class TestArchiveCLI(_BaseTest):
+    """CLI 命令：template-export-execution / template-restore-execution / 重启续跑."""
+
+    def test_cli_export_execution(self):
+        """template-export-execution 成功导出归档."""
+        self._import(self._make_batch())
+        self._run_cli("template-save", "CLI_ARC",
+                      "--steps", "list,export:summary",
+                      "-d", "cli archive test")
+        rc = self._run_cli("template-run", "CLI_ARC")
+        self.assertEqual(rc, 0)
+
+        out = os.path.join(self.tmpdir, "cli_manifest.json")
+        rc = self._run_cli("template-export-execution", "CLI_ARC", "-o", out)
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(out))
+
+        with open(out, "r", encoding="utf-8") as f:
+            m = json.load(f)
+        self.assertEqual(m["execution_meta"]["template_name"], "CLI_ARC")
+
+    def test_cli_export_execution_by_id(self):
+        """template-export-execution -e <id> 按 execution_id 导出."""
+        self._import(self._make_batch())
+        self._run_cli("template-save", "CLI_EID", "--steps", "export:summary")
+        self._run_cli("template-run", "CLI_EID")
+
+        template = templates_mod.get_template(self.db_path, self.config, "CLI_EID")
+        execs = db.list_executions(self.db_path, template_id=template["id"])
+        eid = execs[0]["id"]
+
+        out = os.path.join(self.tmpdir, "by_id.json")
+        rc = self._run_cli("template-export-execution", "-e", str(eid), "-o", out)
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(out))
+
+    def test_cli_restore_execution(self):
+        """template-restore-execution 从清单恢复."""
+        self._import(self._make_batch())
+        self._run_cli("template-save", "CLI_REST", "--steps", "list,export:summary",
+                      "-d", "restore from cli")
+        self._run_cli("template-run", "CLI_REST")
+
+        manifest_path = os.path.join(self.tmpdir, "cli_restore.json")
+        self._run_cli("template-export-execution", "CLI_REST", "-o", manifest_path)
+
+        os.remove(self.db_path)
+        db.init_db(self.db_path)
+
+        rc = self._run_cli("template-restore-execution", manifest_path)
+        self.assertEqual(rc, 0)
+
+        t = templates_mod.get_template(self.db_path, self.config, "CLI_REST")
+        self.assertIsNotNone(t)
+        self.assertEqual(t["description"], "restore from cli")
+
+        self.assertEqual(self._run_cli("template-show", "CLI_REST"), 0)
+
+    def test_cli_restore_conflict_abort_exit_code(self):
+        """冲突时 template-restore-execution 默认 abort 返回非 0."""
+        self._import(self._make_batch())
+        self._run_cli("template-save", "CLI_CNF", "--steps", "export:summary",
+                      "-d", "v1")
+        self._run_cli("template-run", "CLI_CNF")
+
+        manifest_path = os.path.join(self.tmpdir, "conflict.json")
+        self._run_cli("template-export-execution", "CLI_CNF", "-o", manifest_path)
+
+        self._run_cli("template-save", "CLI_CNF", "--steps", "list",
+                      "-d", "v2", "--force")
+
+        rc = self._run_cli("template-restore-execution", manifest_path)
+        self.assertNotEqual(rc, 0)
+
+    def test_cli_restore_conflict_save_as(self):
+        """template-restore-execution --conflict save-as 成功返回 0."""
+        self._import(self._make_batch())
+        self._run_cli("template-save", "CLI_SAVEAS", "--steps", "export:summary",
+                      "-d", "v1")
+        self._run_cli("template-run", "CLI_SAVEAS")
+
+        manifest_path = os.path.join(self.tmpdir, "saveas.json")
+        self._run_cli("template-export-execution", "CLI_SAVEAS", "-o", manifest_path)
+
+        self._run_cli("template-save", "CLI_SAVEAS", "--steps", "list",
+                      "-d", "v2", "--force")
+
+        rc = self._run_cli("template-restore-execution", manifest_path,
+                           "--conflict", "save-as")
+        self.assertEqual(rc, 0)
+
+        self.assertIsNotNone(templates_mod.get_template(
+            self.db_path, self.config, "CLI_SAVEAS_restored",
+        ))
+
+    def test_cli_restart_delete_db_restore_and_resume(self):
+        """完整链路：执行中断 → 导出归档 → 删 DB → 恢复 → 续跑成功."""
+        self._run_cli(
+            "template-save", "FULLCHAIN",
+            "--steps", "export:summary,export:differences",
+            "-d", "full chain test",
+        )
+        rc1 = self._run_cli("template-run", "FULLCHAIN")
+        self.assertEqual(rc1, 2)
+
+        manifest_path = os.path.join(self.tmpdir, "fullchain_manifest.json")
+        self._run_cli("template-export-execution", "FULLCHAIN", "-o", manifest_path)
+
+        os.remove(self.db_path)
+        db.init_db(self.db_path)
+
+        rc2 = self._run_cli("template-restore-execution", manifest_path)
+        self.assertEqual(rc2, 0)
+
+        self._import(self._make_batch("after_restart"))
+
+        rc3 = self._run_cli("template-run", "FULLCHAIN", "--resume")
+        self.assertEqual(rc3, 0)
+
+        self.assertEqual(self._run_cli("template-show", "FULLCHAIN"), 0)
 
 
 if __name__ == "__main__":

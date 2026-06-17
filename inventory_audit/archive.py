@@ -1,0 +1,454 @@
+"""执行归档与恢复模块 - 导出执行清单、从清单恢复执行历史.
+
+归档清单内容：
+- template_snapshot: 冻结的模板快照（含 id/name/version/filters/fields/steps/hash）
+- steps: 每步的 step 定义、status、result、error
+- operator: 操作人
+- active_plan: 执行时激活的方案名
+- export_files: 导出文件信息（路径、文件名、类型、模板版本）
+- config_summary: 必要的配置摘要（csv 列名、状态列表、合并键、输出目录）
+- execution_meta: execution_id、状态、时间戳、步数统计
+- operation_logs: 相关导出操作日志
+"""
+import json
+import os
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+from . import db
+from . import templates as templates_mod
+
+
+MANIFEST_VERSION = 1
+MANIFEST_SCHEMA = "inventory_audit_execution_manifest"
+
+
+def _ensure_archives_dir(config: Dict[str, Any]) -> str:
+    """归档输出目录（与数据库同级的 archives/）."""
+    archives_dir = os.path.join(
+        os.path.dirname(os.path.abspath(config["database"]["path"])),
+        "archives",
+    )
+    os.makedirs(archives_dir, exist_ok=True)
+    return archives_dir
+
+
+def _default_manifest_path(
+    config: Dict[str, Any], execution_id: int, template_name: str,
+) -> str:
+    """默认归档文件路径：archives/exec_{id}_{tplname}_{timestamp}.json."""
+    archives_dir = _ensure_archives_dir(config)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = template_name.replace(os.sep, "_").replace("/", "_").replace("\\", "_")
+    return os.path.join(archives_dir, f"exec_{execution_id}_{safe_name}_{timestamp}.json")
+
+
+def _collect_export_files(
+    db_path: str, execution_id: int,
+) -> List[Dict[str, Any]]:
+    """收集某次执行相关的导出文件信息（从步骤结果和操作日志汇总）."""
+    export_files: List[Dict[str, Any]] = []
+    steps = db.get_steps(db_path, execution_id)
+    seen_paths = set()
+    for step_rec in steps:
+        result = step_rec.get("result") or {}
+        file_path = result.get("file_path")
+        if file_path and file_path not in seen_paths:
+            seen_paths.add(file_path)
+            export_files.append({
+                "step_index": step_rec.get("step_index"),
+                "export_type": result.get("type"),
+                "file_path": file_path,
+                "filename": os.path.basename(file_path),
+                "template_name": result.get("template_name"),
+                "template_version": result.get("template_version"),
+                "count": result.get("count"),
+                "file_exists": os.path.exists(file_path),
+                "file_size": os.path.getsize(file_path) if os.path.exists(file_path) else None,
+            })
+    return export_files
+
+
+def _collect_operation_logs(
+    db_path: str, template_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """收集相关导出操作日志（按模板名过滤）."""
+    logs = db.get_operation_logs(db_path, action_type="export")
+    result = []
+    for log in logs:
+        action_data = log.get("action_data") or {}
+        if template_name and action_data.get("template_name") != template_name:
+            continue
+        result.append({
+            "log_id": log["id"],
+            "operator": log.get("operator"),
+            "export_type": action_data.get("export_type"),
+            "file_path": action_data.get("file_path"),
+            "template_id": action_data.get("template_id"),
+            "template_name": action_data.get("template_name"),
+            "template_version": action_data.get("template_version"),
+            "count": action_data.get("count"),
+            "created_at": log.get("created_at"),
+        })
+    return result
+
+
+def _config_summary(config: Dict[str, Any]) -> Dict[str, Any]:
+    """提取必要的配置摘要：csv 列、状态列表、合并键、输出目录."""
+    csv_cfg = config.get("csv", {})
+    status_cfg = config.get("status", {})
+    rules_cfg = config.get("rules", {})
+    export_cfg = config.get("export", {})
+    return {
+        "csv_columns": {
+            "location": csv_cfg.get("location_column"),
+            "sku": csv_cfg.get("sku_column"),
+            "expected": csv_cfg.get("expected_column"),
+            "counted": csv_cfg.get("counted_column"),
+        },
+        "status_initial": status_cfg.get("initial"),
+        "status_allowed": status_cfg.get("allowed", []),
+        "merge_keys": rules_cfg.get("merge_keys", ["location", "sku"]),
+        "diff_threshold": rules_cfg.get("diff_threshold", 0),
+        "export_output_dir": os.path.abspath(export_cfg.get("output_dir", "./audit_data/exports")),
+    }
+
+
+def export_execution_manifest(
+    db_path: str,
+    config: Dict[str, Any],
+    execution_id: int,
+    output_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """导出执行归档清单.
+
+    Args:
+        db_path: 数据库路径
+        config: 全局配置
+        execution_id: 执行记录 ID
+        output_path: 输出文件路径，None 时自动生成
+
+    Returns:
+        {"success", "file_path", "manifest"}
+    """
+    execution = db.get_execution(db_path, execution_id)
+    if not execution:
+        return {"success": False, "error": f"执行记录不存在：{execution_id}"}
+
+    steps = db.get_steps(db_path, execution_id)
+    steps_payload = []
+    for sr in steps:
+        steps_payload.append({
+            "step_index": sr.get("step_index"),
+            "step": sr.get("step"),
+            "status": sr.get("status"),
+            "result": sr.get("result"),
+            "error": sr.get("error"),
+            "started_at": sr.get("started_at"),
+            "finished_at": sr.get("finished_at"),
+        })
+
+    template_snapshot = execution.get("template_snapshot") or {}
+    tpl_name = template_snapshot.get("name") or execution.get("template_name") or ""
+
+    manifest = {
+        "$schema": MANIFEST_SCHEMA,
+        "$manifest_version": MANIFEST_VERSION,
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "execution_meta": {
+            "execution_id": execution_id,
+            "template_id": execution.get("template_id"),
+            "template_name": execution.get("template_name"),
+            "template_version": execution.get("template_version"),
+            "status": execution.get("status"),
+            "steps_total": execution.get("steps_total"),
+            "steps_done": execution.get("steps_done"),
+            "steps_failed": execution.get("steps_failed"),
+            "started_at": execution.get("started_at"),
+            "finished_at": execution.get("finished_at"),
+            "operator": execution.get("operator"),
+            "active_plan": execution.get("active_plan"),
+        },
+        "template_snapshot": template_snapshot,
+        "steps": steps_payload,
+        "operator": execution.get("operator") or config.get("operator", "cli"),
+        "active_plan": execution.get("active_plan") or config.get("active_plan"),
+        "export_files": _collect_export_files(db_path, execution_id),
+        "operation_logs": _collect_operation_logs(db_path, template_name=tpl_name),
+        "config_summary": _config_summary(config),
+    }
+
+    if output_path is None:
+        output_path = _default_manifest_path(config, execution_id, tpl_name)
+
+    abs_path = os.path.abspath(output_path)
+    try:
+        os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        return {"success": False, "error": f"写入归档文件失败：{e}"}
+
+    return {"success": True, "file_path": abs_path, "manifest": manifest}
+
+
+def load_manifest(manifest_path: str) -> Dict[str, Any]:
+    """加载并校验归档清单文件."""
+    if not os.path.exists(manifest_path):
+        return {"success": False, "error": f"归档文件不存在：{manifest_path}"}
+    try:
+        with open(manifest_path, "r", encoding="utf-8-sig") as f:
+            manifest = json.load(f)
+    except json.JSONDecodeError as e:
+        return {"success": False, "error": f"归档文件损坏（JSON 解析失败）：{e}"}
+    except OSError as e:
+        return {"success": False, "error": f"读取归档文件失败：{e}"}
+
+    if not isinstance(manifest, dict):
+        return {"success": False, "error": "归档文件格式损坏：根结构不是对象"}
+    if manifest.get("$schema") != MANIFEST_SCHEMA:
+        return {"success": False, "error": f"归档 schema 不匹配：{manifest.get('$schema')}"}
+    if not manifest.get("template_snapshot"):
+        return {"success": False, "error": "归档清单缺少 template_snapshot"}
+    if "execution_meta" not in manifest:
+        return {"success": False, "error": "归档清单缺少 execution_meta"}
+    if "steps" not in manifest:
+        return {"success": False, "error": "归档清单缺少 steps"}
+
+    return {"success": True, "manifest": manifest}
+
+
+def detect_restore_conflicts(
+    db_path: str,
+    config: Dict[str, Any],
+    manifest: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """检测恢复冲突.
+
+    冲突类型：
+    - template_upgraded: 同名模板已存在且版本/内容不一致
+    - export_file_exists: 归档中的导出文件已存在于磁盘
+    - active_plan_mismatch: 当前激活方案与归档记录不一致
+    """
+    conflicts: List[Dict[str, Any]] = []
+    snap = manifest.get("template_snapshot") or {}
+    tpl_name = snap.get("name") or manifest["execution_meta"].get("template_name")
+
+    existing = templates_mod.get_template(db_path, config, tpl_name) if tpl_name else None
+    if existing and snap:
+        snap_hash = snap.get("content_hash")
+        cur_hash = existing.get("content_hash")
+        snap_version = int(snap.get("version") or 0)
+        cur_version = int(existing.get("version") or 0)
+        if snap_hash != cur_hash or snap_version != cur_version:
+            conflicts.append({
+                "type": "template_upgraded",
+                "severity": "warning",
+                "message": (
+                    f"同名模板 {tpl_name} 已升级："
+                    f"归档 v{snap_version}（hash {snap_hash[:12] if snap_hash else '?'}）vs "
+                    f"当前 v{cur_version}（hash {cur_hash[:12] if cur_hash else '?'}）"
+                ),
+                "template_name": tpl_name,
+                "archived_version": snap_version,
+                "current_version": cur_version,
+            })
+
+    for ef in manifest.get("export_files", []):
+        fp = ef.get("file_path")
+        if fp and os.path.exists(fp):
+            conflicts.append({
+                "type": "export_file_exists",
+                "severity": "warning",
+                "message": f"导出文件已存在：{fp}",
+                "file_path": fp,
+                "filename": ef.get("filename"),
+            })
+
+    archived_plan = manifest.get("active_plan") or manifest["execution_meta"].get("active_plan")
+    current_plan = config.get("active_plan")
+    if archived_plan != current_plan:
+        conflicts.append({
+            "type": "active_plan_mismatch",
+            "severity": "info",
+            "message": (
+                f"激活方案不一致：归档记录 {archived_plan or '(无)'} vs "
+                f"当前 {current_plan or '(无)'}"
+            ),
+            "archived_plan": archived_plan,
+            "current_plan": current_plan,
+        })
+
+    return conflicts
+
+
+def _restore_template_from_snapshot(
+    db_path: str, config: Dict[str, Any], snap: Dict[str, Any],
+    conflict_resolution: str = "abort",
+) -> Dict[str, Any]:
+    """从归档快照恢复模板.
+
+    conflict_resolution:
+    - "abort": 同名模板冲突时中止
+    - "save-as" / "save_as": 冲突时另存为新模板名（<name>_restored）
+    """
+    if conflict_resolution == "save_as":
+        conflict_resolution = "save-as"
+    tpl_name = snap.get("name")
+    if not tpl_name:
+        return {"success": False, "error": "归档快照缺少模板名"}
+
+    existing = templates_mod.get_template(db_path, config, tpl_name)
+    snap_hash = templates_mod.compute_content_hash(
+        snap.get("filters"), snap.get("export_fields"),
+        snap.get("remark_template"), snap.get("steps"),
+    )
+
+    final_name = tpl_name
+    restored_as_new = False
+
+    if existing:
+        existing_hash = existing.get("content_hash")
+        existing_version = int(existing.get("version") or 0)
+        snap_version = int(snap.get("version") or 0)
+        if existing_hash == snap_hash and existing_version == snap_version:
+            return {"success": True, "template": existing, "action": "matched_existing",
+                    "name": tpl_name}
+        if conflict_resolution == "abort":
+            return {
+                "success": False, "conflict": True, "conflict_type": "template_upgraded",
+                "error": (
+                    f"同名模板 {tpl_name} 已升级，恢复中止。"
+                    f"使用 --conflict save-as 另存为新模板"
+                ),
+                "existing_name": tpl_name,
+            }
+        elif conflict_resolution == "save-as":
+            final_name = f"{tpl_name}_restored"
+            counter = 1
+            while templates_mod.get_template(db_path, config, final_name):
+                final_name = f"{tpl_name}_restored{counter}"
+                counter += 1
+            restored_as_new = True
+        else:
+            return {"success": False, "error": f"未知冲突处理策略：{conflict_resolution}"}
+
+    save_result = templates_mod.save_template(
+        db_path, config, final_name,
+        filters=snap.get("filters"),
+        export_fields=snap.get("export_fields"),
+        remark_template=snap.get("remark_template"),
+        steps=snap.get("steps"),
+        description=snap.get("description") or (
+            f"从归档恢复（原模板 {tpl_name} v{snap.get('version')}）"
+            if restored_as_new else snap.get("description")
+        ),
+        force=False,
+    )
+
+    if not save_result.get("success"):
+        return {"success": False, "error": f"恢复模板失败：{save_result.get('error')}"}
+
+    restored = templates_mod.get_template(db_path, config, final_name)
+    return {
+        "success": True, "template": restored,
+        "action": "save_as" if restored_as_new else save_result.get("action", "created"),
+        "name": final_name, "original_name": tpl_name,
+    }
+
+
+def restore_execution_from_manifest(
+    db_path: str,
+    config: Dict[str, Any],
+    manifest_path: str,
+    conflict_resolution: str = "abort",
+) -> Dict[str, Any]:
+    """从归档清单恢复执行历史.
+
+    Args:
+        db_path: 数据库路径
+        config: 全局配置
+        manifest_path: 归档清单路径
+        conflict_resolution: "abort" | "save-as"
+
+    Returns:
+        {"success", "execution_id", "template", "conflicts", ...}
+    """
+    if conflict_resolution == "save_as":
+        conflict_resolution = "save-as"
+    load_result = load_manifest(manifest_path)
+    if not load_result.get("success"):
+        return {"success": False, "error": load_result.get("error")}
+
+    manifest = load_result["manifest"]
+    conflicts = detect_restore_conflicts(db_path, config, manifest)
+
+    has_blocking = conflict_resolution == "abort" and any(
+        c["type"] == "template_upgraded"
+        for c in conflicts
+    )
+    if has_blocking:
+        return {
+            "success": False, "conflict": True, "conflicts": conflicts,
+            "error": "检测到阻塞冲突，恢复中止。使用 --conflict save-as 忽略非致命冲突",
+        }
+
+    snap = manifest["template_snapshot"]
+    tpl_restore = _restore_template_from_snapshot(
+        db_path, config, snap, conflict_resolution=conflict_resolution,
+    )
+    if not tpl_restore.get("success"):
+        return {
+            "success": False, "conflicts": conflicts,
+            "error": tpl_restore.get("error"),
+            "template_conflict": tpl_restore.get("conflict"),
+        }
+
+    restored_template = tpl_restore["template"]
+    meta = manifest["execution_meta"]
+    operator = manifest.get("operator") or meta.get("operator") or config.get("operator", "cli")
+    active_plan = manifest.get("active_plan") or meta.get("active_plan")
+
+    new_exec_id = db.create_execution(
+        db_path,
+        template_id=restored_template.get("id"),
+        template_name=restored_template.get("name"),
+        template_version=int(restored_template.get("version", 1) or 1),
+        steps_total=len(manifest.get("steps", [])),
+        template_snapshot=snap,
+        operator=operator,
+        active_plan=active_plan,
+    )
+
+    for step_payload in manifest.get("steps", []):
+        idx = step_payload.get("step_index")
+        if idx is None:
+            continue
+        db.upsert_step(
+            db_path, new_exec_id, idx,
+            step=step_payload.get("step") or {},
+            status=step_payload.get("status", "pending"),
+            result=step_payload.get("result"),
+            error=step_payload.get("error"),
+            finished=(step_payload.get("status") in ("done", "failed", "skipped_done")),
+        )
+
+    db.update_execution(
+        db_path, new_exec_id,
+        status=meta.get("status", "running"),
+        steps_done=meta.get("steps_done", 0),
+        steps_failed=meta.get("steps_failed", 0),
+        finished=meta.get("status") in ("completed", "failed"),
+    )
+
+    return {
+        "success": True,
+        "execution_id": new_exec_id,
+        "original_execution_id": meta.get("execution_id"),
+        "template": restored_template,
+        "name": tpl_restore.get("name"),
+        "original_name": tpl_restore.get("original_name"),
+        "template_action": tpl_restore.get("action"),
+        "conflicts": conflicts,
+        "steps_restored": len(manifest.get("steps", [])),
+    }

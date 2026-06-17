@@ -121,6 +121,8 @@ CREATE TABLE IF NOT EXISTS template_executions (
     template_name TEXT,
     template_version INTEGER,
     template_snapshot TEXT,
+    operator TEXT,
+    active_plan TEXT,
     status TEXT DEFAULT 'running',
     steps_total INTEGER NOT NULL DEFAULT 0,
     steps_done INTEGER NOT NULL DEFAULT 0,
@@ -198,12 +200,20 @@ def _migrate_review_history_table(conn) -> None:
 
 
 def _migrate_template_executions_table(conn) -> None:
-    """迁移旧版 template_executions 表：补充 template_snapshot 列."""
+    """迁移旧版 template_executions 表：补充 template_snapshot / operator / active_plan 列."""
     cols = conn.execute("PRAGMA table_info(template_executions)").fetchall()
     col_names = {c["name"] for c in cols}
     if "template_snapshot" not in col_names:
         conn.execute(
             "ALTER TABLE template_executions ADD COLUMN template_snapshot TEXT"
+        )
+    if "operator" not in col_names:
+        conn.execute(
+            "ALTER TABLE template_executions ADD COLUMN operator TEXT"
+        )
+    if "active_plan" not in col_names:
+        conn.execute(
+            "ALTER TABLE template_executions ADD COLUMN active_plan TEXT"
         )
 
 
@@ -1103,6 +1113,8 @@ def create_execution(
     template_version: int,
     steps_total: int,
     template_snapshot: Optional[Dict[str, Any]] = None,
+    operator: Optional[str] = None,
+    active_plan: Optional[str] = None,
 ) -> int:
     """创建一条批量执行记录，冻结模板快照，返回 execution_id."""
     snapshot_json = json.dumps(template_snapshot, ensure_ascii=False) if template_snapshot else None
@@ -1110,9 +1122,11 @@ def create_execution(
         cursor = conn.execute(
             """INSERT INTO template_executions
                (template_id, template_name, template_version,
-                template_snapshot, status, steps_total, steps_done, steps_failed)
-               VALUES (?, ?, ?, ?, 'running', ?, 0, 0)""",
-            (template_id, template_name, template_version, snapshot_json, steps_total),
+                template_snapshot, operator, active_plan,
+                status, steps_total, steps_done, steps_failed)
+               VALUES (?, ?, ?, ?, ?, ?, 'running', ?, 0, 0)""",
+            (template_id, template_name, template_version, snapshot_json,
+             operator, active_plan, steps_total),
         )
         conn.commit()
         return cursor.lastrowid

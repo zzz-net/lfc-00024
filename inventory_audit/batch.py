@@ -5,10 +5,13 @@
    模板后续更新不会静默改写已有执行记录；
 2. 某步失败时前面已完成步骤保留，执行标记为 failed；
 3. 重试（resume 同一 execution_id）时，status=done 的步骤直接跳过，
-   不重复产生日志或导出物；status=failed/pending 的步骤才会重跑。
+   不重复产生日志或导出物；status=failed/pending 的步骤才会重跑；
+4. 每次执行完成或中断后，自动导出执行归档清单（含快照、步骤结果、
+   operator、激活方案、导出文件信息、配置摘要），用于跨环境恢复。
 """
 from typing import Any, Dict, List, Optional
 
+from . import archive as archive_mod
 from . import db
 from . import exporter
 from . import merger
@@ -123,8 +126,9 @@ def run_template(
     template: Optional[Dict[str, Any]],
     output_dir: str,
     allowed_statuses: Optional[List[str]] = None,
-    operator: str = "cli",
+    operator: Optional[str] = None,
     execution_id: Optional[int] = None,
+    auto_archive: bool = True,
 ) -> Dict[str, Any]:
     """按模板步骤批量执行，支持续跑（resume）.
 
@@ -134,13 +138,17 @@ def run_template(
         template: 模板对象（新建执行时用；续跑时优先用冻结快照）
         output_dir: 导出/快照输出目录
         allowed_statuses: 允许的状态列表（replay 步骤需要）
-        operator: 操作人
+        operator: 操作人，None 时从 config.operator 读取
         execution_id: 续跑时传入已存在的执行记录 ID；None 表示新建
+        auto_archive: 执行完成/中断后是否自动导出归档清单
 
     Returns:
         {"success", "execution_id", "status", "steps", "steps_total",
-         "steps_done", "steps_failed", "version_drift"}
+         "steps_done", "steps_failed", "version_drift", "archive_path"}
     """
+    if operator is None:
+        operator = config.get("operator", "cli")
+    active_plan = config.get("active_plan")
     if execution_id is not None:
         execution = db.get_execution(db_path, execution_id)
         if not execution:
@@ -161,6 +169,8 @@ def run_template(
             db_path, template.get("id"), template.get("name"),
             int(template.get("version", 1) or 1), len(steps),
             template_snapshot=snapshot,
+            operator=operator,
+            active_plan=active_plan,
         )
         for i, step in enumerate(steps):
             db.upsert_step(db_path, execution_id, i, step, "pending")
@@ -224,6 +234,17 @@ def run_template(
         steps_done=done, steps_failed=failed, finished=True,
     )
 
+    archive_path = None
+    if auto_archive:
+        try:
+            ar = archive_mod.export_execution_manifest(
+                db_path, config, execution_id,
+            )
+            if ar.get("success"):
+                archive_path = ar.get("file_path")
+        except Exception:  # noqa: BLE001 - 归档失败不影响主流程结果
+            pass
+
     return {
         "success": not interrupted,
         "execution_id": execution_id,
@@ -233,4 +254,5 @@ def run_template(
         "steps_done": done,
         "steps_failed": failed,
         "version_drift": drift,
+        "archive_path": archive_path,
     }
