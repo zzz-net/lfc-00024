@@ -637,7 +637,7 @@ def _parse_steps(args) -> Optional[List[Dict[str, Any]]]:
     steps_file = getattr(args, "steps_file", None)
     if steps_file:
         try:
-            with open(steps_file, "r", encoding="utf-8") as f:
+            with open(steps_file, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
             print(f"[ERROR] 读取步骤文件失败：{e}")

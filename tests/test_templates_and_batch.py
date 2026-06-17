@@ -76,6 +76,9 @@ class _BaseTest(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
+    def _run_cli(self, *argv):
+        return cli.main(["-c", self.cfg_file] + list(argv))
+
     def _import(self, csv_path, **kwargs):
         return importer.import_csv(
             self.db_path, csv_path, self.config["csv"],
@@ -527,9 +530,6 @@ class TestExportMetadataAlignment(_BaseTest):
 class TestCLIChain(_BaseTest):
     """CLI 全链路：新建 → 导入 → 批量执行 → 续跑，覆盖实际命令接线."""
 
-    def _run_cli(self, *argv):
-        return cli.main(["-c", self.cfg_file] + list(argv))
-
     def test_cli_full_chain(self):
         # 新建模板
         rc = self._run_cli(
@@ -578,6 +578,173 @@ class TestCLIChain(_BaseTest):
         self._import(self._make_batch())
         rc = self._run_cli("template-run", "CLI_R", "--resume")
         self.assertEqual(rc, 0)
+
+
+def _write_json_with_encoding(path, data, encoding):
+    """把 JSON 以指定编码写入文件（utf-8-sig 会带 BOM，utf-8 不带）."""
+    with open(path, "w", encoding=encoding, newline="") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+class TestBOMCompatibility(_BaseTest):
+    """UTF-8 BOM 兼容回归：模板导入 / steps 文件 / 落盘恢复均不被带 BOM 的文件卡死.
+
+    Windows 编辑器（Notepad、某些 VS Code 配置、Excel 另存为）常输出带 BOM 的 UTF-8。
+    Python 默认 ``encoding="utf-8"`` 不会自动跳过 BOM，会把 ``\\ufeff`` 留在 JSON 字符串
+    头部导致解析失败。修复点全部集中在导入相关模块的文件读取处。
+    """
+
+    def test_template_import_with_bom(self):
+        """template-import 读取带 BOM 的 JSON，应与普通 UTF-8 一致成功."""
+        tpl = {
+            "name": "BOM_TPL",
+            "version": 1,
+            "description": "带 BOM 的模板",
+            "filters": {"status": "pending"},
+            "export_fields": ["id", "location", "sku", "status"],
+            "steps": [
+                {"action": "list"},
+                {"action": "export", "type": "summary"},
+            ],
+        }
+        bom_path = os.path.join(self.tmpdir, "tpl_bom.json")
+        plain_path = os.path.join(self.tmpdir, "tpl_plain.json")
+        _write_json_with_encoding(bom_path, tpl, "utf-8-sig")
+        _write_json_with_encoding(plain_path, tpl, "utf-8")
+
+        # 确认文件确实带 BOM
+        with open(bom_path, "rb") as f:
+            head = f.read(3)
+        self.assertEqual(head, b"\xef\xbb\xbf", "测试前提：文件应带 UTF-8 BOM")
+
+        # 带 BOM 导入成功
+        r1 = templates_mod.import_template(self.db_path, self.config, bom_path)
+        self.assertTrue(r1["success"], f"BOM 导入失败：{r1.get('error')}")
+        self.assertEqual(r1["action"], "created")
+
+        # 普通 UTF-8 再次重名导入（无变更）
+        r2 = templates_mod.import_template(self.db_path, self.config, plain_path)
+        self.assertTrue(r2["success"])
+        self.assertEqual(r2["action"], "unchanged")
+
+        # 读回来确认内容正确
+        t = templates_mod.get_template(self.db_path, self.config, "BOM_TPL")
+        self.assertIsNotNone(t)
+        self.assertEqual(t["description"], "带 BOM 的模板")
+        self.assertEqual(t["filters"]["status"], "pending")
+        self.assertEqual(len(t["steps"]), 2)
+
+    def test_steps_file_with_bom_via_cli(self):
+        """template-save --steps-file 读取带 BOM 的 JSON，保存成功."""
+        steps = [
+            {"action": "list"},
+            {"action": "export", "type": "differences"},
+            {"action": "export", "type": "summary"},
+        ]
+        bom_steps = os.path.join(self.tmpdir, "steps_bom.json")
+        _write_json_with_encoding(bom_steps, steps, "utf-8-sig")
+
+        with open(bom_steps, "rb") as f:
+            head = f.read(3)
+        self.assertEqual(head, b"\xef\xbb\xbf")
+
+        rc = self._run_cli(
+            "template-save", "BOM_STEPS",
+            "--steps-file", bom_steps,
+            "-d", "带 BOM 的 steps",
+        )
+        self.assertEqual(rc, 0, "--steps-file 带 BOM 应解析成功并保存")
+
+        t = templates_mod.get_template(self.db_path, self.config, "BOM_STEPS")
+        self.assertIsNotNone(t)
+        self.assertEqual(len(t["steps"]), 3)
+        self.assertEqual(t["steps"][0]["action"], "list")
+        self.assertEqual(t["steps"][1]["type"], "differences")
+        self.assertEqual(t["steps"][2]["type"], "summary")
+
+    def test_persisted_bom_template_recovers(self):
+        """落盘的 templates/<name>.json 即使被外部编辑成带 BOM，重启后仍能恢复.
+
+        （虽然我们自己写入用 utf-8 不带 BOM，但用户可能直接改文件）
+        """
+        # 先创建一个普通模板，触发落盘
+        self._save_template("RC_BOM", description="会被改成带 BOM")
+        tpl_file = os.path.join(
+            os.path.dirname(self.db_path), "templates", "RC_BOM.json",
+        )
+        self.assertTrue(os.path.exists(tpl_file))
+
+        # 用带 BOM 覆盖写（模拟用户用 Windows 记事本保存）
+        with open(tpl_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        _write_json_with_encoding(tpl_file, data, "utf-8-sig")
+
+        with open(tpl_file, "rb") as f:
+            head = f.read(3)
+        self.assertEqual(head, b"\xef\xbb\xbf")
+
+        # 删除 DB 后恢复（走 get_template 的落盘回写路径）
+        os.remove(self.db_path)
+        db.init_db(self.db_path)
+
+        recovered = templates_mod.get_template(self.db_path, self.config, "RC_BOM")
+        self.assertIsNotNone(recovered, "带 BOM 的落盘文件应能恢复")
+        self.assertEqual(recovered["name"], "RC_BOM")
+        self.assertEqual(recovered["description"], "会被改成带 BOM")
+
+    def test_plain_utf8_no_regression(self):
+        """普通无 BOM 的 UTF-8 JSON 不应被破坏（仍正常导入）."""
+        tpl = {
+            "name": "NO_BOM",
+            "steps": [{"action": "list"}, {"action": "export", "type": "summary"}],
+        }
+        path = os.path.join(self.tmpdir, "nobom.json")
+        _write_json_with_encoding(path, tpl, "utf-8")
+        # 确认无 BOM
+        with open(path, "rb") as f:
+            head = f.read(3)
+        self.assertNotEqual(head, b"\xef\xbb\xbf")
+
+        r = templates_mod.import_template(self.db_path, self.config, path)
+        self.assertTrue(r["success"], f"普通 UTF-8 导入失败：{r.get('error')}")
+        self.assertEqual(r["action"], "created")
+
+    def test_cli_full_chain_with_bom_templates(self):
+        """CLI 实际链路：从带 BOM 文件新建模板 → 批量执行 → 重启后恢复再执行."""
+        # 1. 用带 BOM 的模板文件通过 CLI 导入
+        tpl = {
+            "name": "CHAIN_BOM",
+            "version": 1,
+            "description": "全链路 BOM 测试模板",
+            "export_fields": ["id", "location", "sku", "status"],
+            "steps": [
+                {"action": "list"},
+                {"action": "export", "type": "summary"},
+            ],
+        }
+        bom_file = os.path.join(self.tmpdir, "chain_bom.json")
+        _write_json_with_encoding(bom_file, tpl, "utf-8-sig")
+        rc = self._run_cli("template-import", bom_file)
+        self.assertEqual(rc, 0, "带 BOM 模板 CLI 导入应成功")
+
+        # 2. 按模板批量执行
+        self._import(self._make_batch("chain"))
+        rc = self._run_cli("template-run", "CHAIN_BOM")
+        self.assertEqual(rc, 0, "按导入模板批量执行应成功")
+
+        # 3. 导出 + 再次导入（模拟跨环境分享）验证内容完整
+        export_path = os.path.join(self.tmpdir, "exported.json")
+        rc = self._run_cli("template-export", "CHAIN_BOM", export_path)
+        self.assertEqual(rc, 0)
+
+        # 删除后从导出文件再导入，用 CLI
+        self._run_cli("template-delete", "CHAIN_BOM")
+        rc = self._run_cli("template-import", export_path)
+        self.assertEqual(rc, 0, "导出→删除→导入还原应成功")
+        t = templates_mod.get_template(self.db_path, self.config, "CHAIN_BOM")
+        self.assertIsNotNone(t)
+        self.assertEqual(t["description"], "全链路 BOM 测试模板")
+        self.assertEqual(len(t["steps"]), 2)
 
 
 if __name__ == "__main__":

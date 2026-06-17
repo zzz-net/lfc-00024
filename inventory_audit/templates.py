@@ -17,6 +17,16 @@ VALID_STEP_ACTIONS = ("list", "export", "replay")
 VALID_EXPORT_TYPES = ("differences", "summary", "sources")
 
 
+def _read_json_file(file_path: str) -> Any:
+    """读取 JSON 文件，兼容 UTF-8 BOM（Windows 常见）.
+
+    使用 ``utf-8-sig`` 打开，既有 BOM 时自动剥离，无 BOM 时行为等价于
+    ``utf-8``。覆盖模板导入、落盘恢复、steps 文件等所有外部 JSON 输入。
+    """
+    with open(file_path, "r", encoding="utf-8-sig") as f:
+        return json.load(f)
+
+
 def _ensure_template_dir(config: Dict[str, Any]) -> str:
     """模板落盘目录（与数据库同级的 templates/）."""
     plan_dir = os.path.join(
@@ -240,8 +250,7 @@ def get_template(db_path: str, config: Dict[str, Any], name: str) -> Optional[Di
     try:
         file_path = _template_file_path(config, name)
         if os.path.exists(file_path):
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = _read_json_file(file_path)
             ok, err = validate_template(data)
             if not ok:
                 return None
@@ -325,8 +334,7 @@ def import_template(
     if not os.path.exists(file_path):
         return {"success": False, "error": f"模板文件不存在：{file_path}"}
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = _read_json_file(file_path)
     except json.JSONDecodeError as e:
         return {"success": False, "error": f"模板配置损坏（JSON 解析失败）：{e}"}
     except OSError as e:
