@@ -1524,5 +1524,86 @@ class TestArchiveCLI(_BaseTest):
         self.assertEqual(self._run_cli("template-show", "FULLCHAIN"), 0)
 
 
+class TestDocumentationCoverage(unittest.TestCase):
+    """防止 USAGE.md 再次遗漏 CLI 命令入口与关键操作说明."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        cls.usage_path = os.path.join(root, "USAGE.md")
+        with open(cls.usage_path, "r", encoding="utf-8") as f:
+            cls.content = f.read()
+
+    def test_usage_md_exists(self):
+        self.assertTrue(
+            os.path.isfile(self.usage_path),
+            f"USAGE.md 缺失，路径应为 {self.usage_path}",
+        )
+
+    def test_all_template_commands_documented(self):
+        commands = [
+            "template-save",
+            "template-list",
+            "template-show",
+            "template-delete",
+            "template-import",
+            "template-export",
+            "template-run",
+            "template-export-execution",
+            "template-restore-execution",
+        ]
+        for cmd in commands:
+            self.assertIn(
+                cmd,
+                self.content,
+                f"USAGE.md 遗漏命令入口: {cmd}",
+            )
+
+    def test_archive_conflict_policy_documented(self):
+        for keyword in [
+            "--conflict abort",
+            "--conflict save-as",
+            "template_upgraded",
+            "export_file_exists",
+            "active_plan_mismatch",
+        ]:
+            self.assertIn(
+                keyword,
+                self.content,
+                f"USAGE.md 遗漏归档恢复冲突说明: {keyword}",
+            )
+
+    def test_post_restore_steps_documented(self):
+        for keyword in [
+            "template-show",
+            "template-run",
+            "--resume",
+            "template-export-execution",
+        ]:
+            self.assertIn(
+                keyword,
+                self.content,
+                f"USAGE.md 遗漏恢复后验证步骤: {keyword}",
+            )
+
+    def test_cli_help_matches_documented_commands(self):
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        help_path = os.path.join(root, "inventory_audit", "__main__.py")
+        self.assertTrue(os.path.isfile(help_path))
+        for keyword in [
+            "archives/",
+            "templates/",
+            "batch.py",
+            "archive.py",
+            "templates.py",
+        ]:
+            self.assertIn(
+                keyword,
+                self.content,
+                f"USAGE.md 遗漏目录/模块说明: {keyword}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
+

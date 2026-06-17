@@ -210,6 +210,94 @@ python -m inventory_audit replay [-p 方案名] [-o 操作人] [-r keep|snapshot
 - `keep`：跳过冲突条目，保留当前数据库状态
 - `snapshot`：将当前差异状态另存为 `exports/snapshot_diff<ID>_<时间戳>_conflict.json`，然后跳过该条
 
+### 19. `template-save` - 保存复核方案模板（版本化）
+
+```bash
+python -m inventory_audit template-save <模板名> \
+    [-s 状态过滤] [-l 库位过滤] [--sku SKU过滤] \
+    [-f 导出字段(逗号分隔)] [-r 备注模板] \
+    [-a list,export,replay(逗号分隔)]
+```
+
+把筛选条件、导出字段、备注模板、批量执行动作打包为可复用模板，带自增版本号。
+`-a` 指定该模板的批量执行顺序（默认 `list,export,replay`）。
+
+### 20. `template-list` / `template-show` / `template-delete`
+
+```bash
+python -m inventory_audit template-list
+python -m inventory_audit template-show <模板名>
+python -m inventory_audit template-delete <模板名>
+```
+
+`template-show` 会显示最新版本的完整内容，包括最近一次执行记录（如有）。
+
+### 21. `template-import` / `template-export`
+
+```bash
+python -m inventory_audit template-import <json文件>
+python -m inventory_audit template-export <模板名> [-o 输出路径]
+```
+
+用于跨环境迁移模板。导入时自动处理重名和版本冲突。
+
+### 22. `template-run` - 按模板批量执行
+
+```bash
+python -m inventory_audit template-run <模板名> [--execution-id ID] [--resume]
+```
+
+按模板 action 顺序批量执行 list/export/replay，每次运行产生一条执行记录，
+状态为 `running`/`completed`/`interrupted`。
+
+- `--resume`：续跑最近一次未完成的执行（从失败步骤继续）
+- `--execution-id`：续跑指定 ID 的执行记录
+
+### 23. `template-export-execution` - 导出执行归档清单
+
+```bash
+python -m inventory_audit template-export-execution <模板名> \
+    [-e 执行ID] [-o 输出路径]
+```
+
+把一次模板执行的完整上下文打包为 JSON：模板快照、步骤结果、operator、
+激活方案、所有导出记录、操作日志。默认输出到 `archives/` 目录。
+
+- 不传 `-e` 时导出该模板最近一次执行
+- 传 `-o` 时写到指定路径
+
+### 24. `template-restore-execution` - 从归档清单恢复执行历史
+
+```bash
+python -m inventory_audit template-restore-execution <归档文件> \
+    [--conflict abort|save-as]
+```
+
+把归档清单还原到当前环境：重建模板（如缺失）、恢复执行记录、步骤结果、
+导出记录、操作日志。
+
+**冲突类型**（默认 `--conflict abort`，遇到立即中止不改动任何数据）：
+- `template_upgraded`：当前环境中的模板版本号高于归档
+- `export_file_exists`：归档中导出的 CSV 文件在磁盘上已存在
+- `active_plan_mismatch`：归档记录的激活方案与当前 runtime 激活方案不一致
+
+**`--conflict save-as` 行为**：
+- 模板升级冲突 → 另存为 `<模板名>_restored`（若仍冲突则追加序号 `_restored[2|3|…]`）
+- 导出文件已存在 → 仅恢复元数据到数据库，磁盘文件保持不变（不覆盖）
+- 方案不一致 → 恢复的执行记录保留归档中的 active_plan，不修改当前 runtime 激活方案
+
+**恢复后可验证**：
+```bash
+# 查看恢复后的执行摘要（模板名、版本、operator、步骤状态）
+python -m inventory_audit template-show <模板名>
+
+# 恢复的执行若为 interrupted，可续跑
+python -m inventory_audit template-run <模板名> --resume
+
+# 恢复完成的执行可再次导出，元数据应与原归档一致
+python -m inventory_audit template-export-execution <模板名>
+```
+
 ## 配置说明
 
 配置文件为 JSON 格式，示例见 `samples/config.json`。
@@ -243,6 +331,9 @@ python -m inventory_audit replay [-p 方案名] [-o 操作人] [-r keep|snapshot
 - **复核方案 (Plan)**: 筛选条件、导出字段、备注模板的集合；持久化在数据库 + JSON
 - **操作日志 (Operation Log)**: 所有 status_change / remark_change / undo / export 的不可变记录，用于回放
 - **操作人 (Operator)**: 每条操作的执行者，落盘到 runtime_state.json
+- **复核方案模板 (Template)**: 方案筛选 + 导出字段 + 执行动作的打包，带版本号，可导入导出
+- **模板执行记录 (Execution)**: 一次 `template-run` 的完整快照（步骤结果、状态、operator、激活方案）
+- **执行归档清单 (Archive)**: 执行记录 + 模板快照 + 操作日志的 JSON 打包，可离线恢复
 
 ### 状态流转
 
@@ -277,6 +368,9 @@ pending (待处理)
 | 切换方案后再导入 | 旧批次 ID、名称、汇总绝对不变，只新增新批次 |
 | 回放遇到跨方案/跨操作者冲突 | 按 `-r` 策略处理：abort / keep / snapshot |
 | 数据库重建但 plans/*.json 还在 | 下次 `get_plan` 自动从 JSON 回补到数据库 |
+| 模板批量执行中途中断 | 执行记录状态保留为 `interrupted`，用 `template-run --resume` 续跑 |
+| 恢复归档时模板已升级/导出文件已存在/激活方案不一致 | 按 `--conflict` 处理：abort（默认，中止不改动）/ save-as（另存为新模板名，不覆盖磁盘文件） |
+| 归档恢复后执行是 interrupted 状态 | 直接 `template-run --resume` 从断点继续 |
 
 ## 目录结构
 
@@ -286,10 +380,13 @@ inventory_audit/         # 主包
   __main__.py
   cli.py                 # CLI 入口
   config.py              # 配置加载 + runtime_state 读写
-  db.py                  # 数据库操作（含 plans / operation_logs）
+  db.py                  # 数据库操作（含 plans / operation_logs / templates / executions）
   importer.py            # CSV 导入
   merger.py              # 差异合并与查询
   plans.py               # 复核方案管理（CRUD + 落盘 + 筛选合并）
+  templates.py           # 模板 CRUD + 版本化 + 导入导出
+  batch.py               # 按模板批量执行 + 续跑
+  archive.py             # 执行归档导出 / 恢复 + 冲突检测
   replay.py              # 操作日志回放 + 冲突检测
   reviewer.py            # 复核操作（状态、备注、撤销）
   exporter.py            # 报告导出（方案字段 + 一致性元数据）
@@ -297,6 +394,7 @@ inventory_audit/         # 主包
 tests/                   # 测试
   test_regression.py     # 原有回归测试
   test_plans_and_replay.py  # 方案 / 回放 / 冲突 / 重启续用 测试
+  test_templates_and_batch.py  # 模板 / 批量执行 / 归档恢复 测试
 
 samples/                 # 样例文件
   config.json            # 样例配置
@@ -308,5 +406,8 @@ audit_data/              # 运行时数据（自动创建）
   runtime_state.json     # active_plan + operator 持久化
   plans/                 # 方案 JSON 双写目录
     <方案名>.json
+  templates/             # 模板 JSON 双写目录
+    <模板名>.json
   exports/               # 导出报告 + 冲突快照
+  archives/              # 执行归档清单（template-export-execution 默认输出目录）
 ```
