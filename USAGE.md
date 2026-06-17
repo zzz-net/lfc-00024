@@ -247,11 +247,28 @@ python -m inventory_audit template-export <模板名> <输出文件路径>
 python -m inventory_audit template-run <模板名> [--execution-id ID] [--resume]
 ```
 
-按模板 action 顺序批量执行 list/export/replay，每次运行产生一条执行记录，
-状态为 `running`/`completed`/`interrupted`。
+按模板 action 顺序批量执行 list/export/replay，每次运行产生一条执行记录。
+
+**执行状态（统一术语，共 4 种）**：
+
+| 状态值 | 中文说明 | 返回码 | 是否可续跑 |
+|--------|----------|--------|-----------|
+| `pending` | 待执行（已创建未开始） | - | ✅ 是 |
+| `running` | 执行中（进程被外部终止） | - | ✅ 是 |
+| `failed` | 执行中断（某步失败，已完成步骤保留） | 2 | ✅ 是 |
+| `completed` | 全部步骤成功完成 | 0 | ❌ 否 |
+
+**【续跑条件】统一规则**：只要执行状态 **不是 completed**，就可以用 `--resume` 续跑。
+续跑时，状态为 `done` 的已完成步骤会被标记为 `skipped_done` 跳过，**不重复产生日志或导出文件**；
+状态为 `failed`/`running`/`pending` 的步骤从当前位置继续执行。
 
 - `--resume`：续跑最近一次未完成的执行（从失败步骤继续）
 - `--execution-id`：续跑指定 ID 的执行记录
+
+**返回码说明**：
+- `0`：所有步骤完成（状态 `completed`）
+- `1`：命令参数错误或环境问题
+- `2`：某步执行失败（状态 `failed`），可使用 `--resume` 续跑
 
 ### 23. `template-export-execution` - 导出执行归档清单
 
@@ -273,21 +290,45 @@ python -m inventory_audit template-preview-archive <归档文件> \
     [--no-conflict-check]
 ```
 
-**恢复前必做步骤**：不执行任何恢复操作，先让你看清归档里带了哪些执行信息、
-恢复后可能碰到什么冲突，再决定怎么继续。
+---
+**⚠️ 恢复前必做步骤**
 
-**输出内容包括**：
-- 归档文件基本信息（版本、导出时间）
-- 原执行信息（ID、状态、步骤统计、操作人、激活方案）
-- 模板快照（名称、版本、筛选条件、导出字段、步骤定义）
-- 每步执行状态和结果（完成/失败/待执行、导出文件名、错误信息）
-- 导出文件列表（文件名、大小、是否存在）
-- 相关操作日志数量
-- **冲突检测结果**（阻塞冲突需处理后才能恢复）
-- 建议的下一步操作和恢复命令
+在运行 `template-restore-execution` 之前，必须先运行此命令预检。
+不执行任何恢复操作，不改动任何数据，只让你看清归档里带了哪些执行信息、
+恢复后可能碰到什么冲突，再决定使用 `--conflict abort` 还是 `save-as`。
+
+---
+
+**输出内容结构（按顺序显示）**：
+
+| 输出区块 | 内容说明 |
+|----------|----------|
+| **归档基本信息** | 文件路径、清单 schema 版本、归档导出时间 |
+| **执行信息** | 原执行 ID、状态(failed/completed/running/pending)、开始/结束时间、步骤统计(done/total/failed)、操作人、激活方案 |
+| **模板快照** | 模板名称、版本、描述、内容指纹、筛选条件(status/location/sku)、导出字段、备注模板、步骤数量 |
+| **执行步骤详情** | 每步的序号、状态标签([完成]/[失败/中断]/[跳过/已完成]/[待执行]/[运行中])、动作名（含子类型）、导出文件名、错误信息（如有） |
+| **【执行状态说明】** | **新增统一术语提示**：当前状态中文名 + 是否可续跑；续跑条件：状态 ≠ completed；续跑时已完成步骤标记为 skipped_done，不重复导出 |
+| **导出文件列表** | 每步导出的文件名、文件类型(summary/differences/sources)、文件大小、磁盘上是否仍存在 |
+| **操作日志数量** | 与该模板相关的导出操作日志条数 |
+| **恢复冲突检测** | 仅当有数据库时显示；区分「阻塞冲突」和「提示冲突」；每项含类型、说明、save-as 自动处理方式 |
+| **建议下一步** | 根据冲突情况和执行状态给出建议命令 |
+
+**步骤状态标签（共 5 种，与内部状态一一对应）**：
+| 标签显示 | 对应内部状态 | 含义 | 续跑时行为 |
+|----------|-------------|------|-----------|
+| `[完成]` | `done` | 步骤执行成功 | 标记 `skipped_done`，不重跑 |
+| `[失败/中断]` | `failed` | 步骤执行失败或异常中断 | 从这一步开始重跑 |
+| `[跳过/已完成]` | `skipped_done` | 续跑时因已完成而跳过 | 保持跳过 |
+| `[待执行]` | `pending` | 步骤尚未开始执行 | 从这一步开始执行 |
+| `[运行中]` | `running` | 步骤开始但未持久化完成（进程被 kill） | 从这一步重新执行 |
+
+**阻塞冲突类型（共 3 类）**：
+1. `template_upgraded`：当前环境同名模板已升级（版本/内容不同）
+2. `export_file_exists`：归档中导出的 CSV 在磁盘上已存在
+3. `active_plan_mismatch`：归档记录的激活方案与当前 runtime 不同
 
 **参数说明**：
-- `--no-conflict-check`：离线场景使用，仅查看内容不检测冲突
+- `--no-conflict-check`：离线场景使用。跳过数据库连接，仅显示归档内容摘要，不检测冲突（也不输出「恢复冲突检测」和具体建议命令）
 
 ### 25. `template-restore-execution` - 从归档清单恢复执行历史
 
@@ -299,35 +340,53 @@ python -m inventory_audit template-restore-execution <归档文件> \
 把归档清单还原到当前环境：重建模板（如缺失）、恢复执行记录、步骤结果、
 导出记录、操作日志。
 
-**冲突类型**（默认 `--conflict abort`，遇到立即中止不改动任何数据）：
-- `template_upgraded`：当前环境中的模板版本号高于归档
-- `export_file_exists`：归档中导出的 CSV 文件在磁盘上已存在
-- `active_plan_mismatch`：归档记录的激活方案与当前 runtime 激活方案不一致
+---
+**⚠️ 恢复前必须先预检**
 
-**`--conflict save-as` 行为**：
-- 模板升级冲突 → 另存为 `<模板名>_restored`（若仍冲突则追加序号 `_restored[2|3|…]`）
-- 导出文件已存在 → 仅恢复元数据到数据库，磁盘文件保持不变（不覆盖）
-- 方案不一致 → 恢复的执行记录保留归档中的 active_plan，不修改当前 runtime 激活方案
+必须先用 `template-preview-archive` 预览归档内容和冲突，确认无误后再执行恢复。
 
-**建议操作顺序**：
-1. 先用 `template-preview-archive` 预览归档内容和冲突
-2. 根据冲突情况选择 `--conflict` 策略
+---
+
+**阻塞冲突类型 × 风险等级**：
+
+| 冲突类型 | 风险说明 | abort 行为 | save-as 自动处理方式 |
+|----------|----------|-----------|---------------------|
+| `template_upgraded` | 当前环境同名模板已升级（版本/内容不同），恢复旧版本会覆盖已升级的模板定义 | 立即中止 | 模板另存为 `<name>_restored`（冲突则 `_restored[2|3…]`），不改动现有模板 |
+| `export_file_exists` | 归档中导出的 CSV 在磁盘上已存在，恢复会造成文件名重复或意外覆盖 | 立即中止 | **仅恢复元数据**到数据库，磁盘现有文件保持不变（不覆盖） |
+| `active_plan_mismatch` | 归档记录的激活方案与当前 runtime 不同，直接恢复会混淆方案归属 | 立即中止 | 恢复的执行记录保留归档的 active_plan，**不修改当前 runtime** 激活方案 |
+
+**冲突策略行为详表**：
+
+| 策略 | 有阻塞冲突时 | 无冲突时 | 数据改动保证 |
+|------|-------------|---------|-------------|
+| `--conflict abort`（默认） | 立即中止，返回码 2 | 正常恢复，返回码 0 | **不改动任何数据**，abort 发生时 DB/templates/磁盘文件全部不变 |
+| `--conflict save-as` | 按上表逐一自动处理，处理成功后继续恢复 | 正常恢复，返回码 0 | 模板可能新增（`_restored` 后缀名），DB 写入恢复数据，磁盘文件从不覆盖 |
+
+**恢复后状态与续跑条件**：
+- 恢复的执行记录状态与归档完全一致（`pending`/`running`/`failed`/`completed`）
+- **【续跑条件-统一规则】**：只要状态 **不是 completed**，就可以 `--resume` 续跑
+- 续跑时，已完成步骤（status=done）被标记为 `skipped_done`，不重复产生日志或导出文件
+
+**建议操作顺序（6 步）**：
+1. 用 `template-preview-archive` 预览归档内容和冲突
+2. 根据冲突情况选择 `--conflict` 策略：无冲突/想自动处理 → `save-as`；不想自动改动 → `abort`
 3. 执行恢复
-4. 用 `template-show` 验证结果
-5. 如有未完成步骤，用 `template-run --resume` 续跑
-6. 用 `template-export-execution` 再次导出归档核对
+4. 用 `template-show` 验证恢复结果（模板名、版本、operator、步骤统计、执行状态）
+5. 若状态不是 completed，用 `template-run --resume` 续跑
+6. 用 `template-export-execution` 再次导出归档，核对元数据与原归档一致
 
-**恢复后可验证**：
+**恢复后验证命令**：
 ```bash
-# 查看恢复后的执行摘要（模板名、版本、operator、步骤状态）
+# 查看恢复后的执行摘要（模板名、版本、operator、步骤状态、续跑命令提示）
 python -m inventory_audit template-show <模板名>
 
-# 恢复的执行若为 interrupted，可续跑
+# 【续跑条件】恢复的执行若状态不是 completed，可续跑（failed/running/pending 均可）
 python -m inventory_audit template-run <模板名> --resume
 
 # 恢复完成的执行可再次导出，元数据应与原归档一致
 python -m inventory_audit template-export-execution <模板名>
 ```
+
 
 ## 完整操作链路指南
 
@@ -355,7 +414,12 @@ python -m inventory_audit -c samples/config.json template-show daily_report
 # 5. 按模板批量执行
 python -m inventory_audit -c samples/config.json template-run daily_report
 
-# 6. 如果执行中断（返回码 2），续跑
+# 6. 【统一术语说明】
+#    - 成功完成：返回码 0，状态 = completed（无需续跑）
+#    - 某步失败：返回码 2，状态 = failed（执行中断，可续跑）
+#    - 续跑条件：状态「不是 completed」（pending/running/failed 三种都能 --resume）
+#    - 续跑保证：已完成步骤标记为 skipped_done，不重复写日志或导出文件
+#    如果执行中断（返回码 2，状态 = failed），续跑
 python -m inventory_audit -c samples/config.json template-run daily_report --resume
 
 # 7. 导出执行归档
@@ -487,21 +551,38 @@ pending (待处理)
 
 ## 异常场景处理
 
-| 场景 | 行为 |
-|------|------|
-| SKU 为空 | 跳过该行，记录错误信息 |
-| 数量非法（非数字） | 跳过该行，记录错误信息 |
-| 零差异行 | 自动跳过，不进入差异库 |
-| 重复导入同一文件 | 提示已导入，返回原批次 ID，不破坏数据 |
-| 撤销空历史 | 返回友好提示，不报错 |
-| 程序中断后重启 | 数据已持久化，继续操作即可；方案/操作人自动恢复 |
-| 多批次合并 | 同一 merge_key 自动累加差异量，保留所有来源 |
-| 切换方案后再导入 | 旧批次 ID、名称、汇总绝对不变，只新增新批次 |
-| 回放遇到跨方案/跨操作者冲突 | 按 `-r` 策略处理：abort / keep / snapshot |
-| 数据库重建但 plans/*.json 还在 | 下次 `get_plan` 自动从 JSON 回补到数据库 |
-| 模板批量执行中途中断 | 执行记录状态保留为 `interrupted`，用 `template-run --resume` 续跑 |
-| 恢复归档时模板已升级/导出文件已存在/激活方案不一致 | 按 `--conflict` 处理：abort（默认，中止不改动）/ save-as（另存为新模板名，不覆盖磁盘文件） |
-| 归档恢复后执行是 interrupted 状态 | 直接 `template-run --resume` 从断点继续 |
+| 场景 | 行为 | 状态 / 返回值 |
+|------|------|---------------|
+| SKU 为空 | 跳过该行，记录错误信息 | 返回码 0 |
+| 数量非法（非数字） | 跳过该行，记录错误信息 | 返回码 0 |
+| 零差异行 | 自动跳过，不进入差异库 | 返回码 0 |
+| 重复导入同一文件 | 提示已导入，返回原批次 ID，不破坏数据 | 返回码 0 |
+| 撤销空历史 | 返回友好提示，不报错 | 返回码 0 |
+| 程序中断后重启 | 数据已持久化，继续操作即可；方案/操作人自动恢复 | - |
+| 多批次合并 | 同一 merge_key 自动累加差异量，保留所有来源 | - |
+| 切换方案后再导入 | 旧批次 ID、名称、汇总绝对不变，只新增新批次 | - |
+| 回放遇到跨方案/跨操作者冲突 | 按 `-r` 策略处理：abort / keep / snapshot | abort 返回非 0 |
+| 数据库重建但 plans/*.json 还在 | 下次 `get_plan` 自动从 JSON 回补到数据库 | - |
+| 模板批量执行中途中断 | 执行记录状态保留为 **`failed`**（执行中断），已完成步骤不重复产生日志 | 执行状态: `failed`；返回码 2 |
+| 恢复归档时模板已升级/导出文件已存在/激活方案不一致 | 按 `--conflict` 处理：abort（默认，中止不改动任何数据）/ save-as（另存为新模板名，不覆盖磁盘文件） | abort: 返回码 2；save-as: 返回码 0 |
+| 归档恢复后执行状态为 **不是 completed** | 直接 `template-run --resume` 从断点继续；已完成步骤标记为 `skipped_done`，不重复导出 | `pending`/`running`/`failed` 均可续跑 |
+
+---
+
+**续跑核心保证**：
+1. `--resume` 判定条件：**执行状态不是 completed** 就可以续跑（pending/running/failed 三种均可）
+2. 已完成步骤（status=done）续跑时被标记为 `skipped_done`，**不会**重复产生日志或写入导出文件
+3. `failed` 步骤被重跑，`running`/`pending` 步骤从当前位置继续执行
+
+---
+
+**执行状态速查表（4 种）**：
+| 状态值 | 中文 | 是否可续跑 |
+|--------|------|-----------|
+| `pending` | 待执行 | ✅ 是 |
+| `running` | 执行中 | ✅ 是 |
+| `failed` | 执行中断 | ✅ 是 |
+| `completed` | 已完成 | ❌ 否 |
 
 ## 目录结构
 

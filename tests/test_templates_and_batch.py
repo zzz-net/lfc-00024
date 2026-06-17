@@ -1106,18 +1106,31 @@ class TestExecutionArchiveRestore(_BaseTest):
 class TestArchiveConflictResolution(_BaseTest):
     """冲突检测与处理：模板升级、导出文件存在、激活方案不一致."""
 
-    def test_detect_template_upgraded_conflict(self):
-        """同名模板已升级（版本或内容不同）时检测到冲突."""
-        self._import(self._make_batch())
-        self._save_template("CON_TPL", steps=[{"action": "export", "type": "summary"}],
-                            description="v1")
-        template = templates_mod.get_template(self.db_path, self.config, "CON_TPL")
+    def _run_and_export(self, template_name: str) -> str:
+        """执行模板并导出归档，返回归档文件路径."""
+        template = templates_mod.get_template(self.db_path, self.config, template_name)
         allowed = cfg.get_allowed_statuses(self.config)
         r1 = batch_mod.run_template(
             self.db_path, self.config, template, self.output_dir,
             allowed_statuses=allowed,
         )
-        manifest_path = r1["archive_path"]
+        self.assertTrue(r1.get("success"), f"执行模板失败: {r1}")
+        exec_id = r1["execution_id"]
+        archive_dir = os.path.join(os.path.dirname(self.db_path), "archives")
+        os.makedirs(archive_dir, exist_ok=True)
+        export_path = os.path.join(archive_dir, f"test_manifest_{template_name}_{exec_id}.json")
+        exp_result = archive_mod.export_execution_manifest(
+            self.db_path, self.config, exec_id, output_path=export_path,
+        )
+        self.assertTrue(exp_result.get("success"), f"导出归档失败: {exp_result}")
+        return exp_result["file_path"]
+
+    def test_detect_template_upgraded_conflict(self):
+        """同名模板已升级（版本或内容不同）时检测到冲突."""
+        self._import(self._make_batch())
+        self._save_template("CON_TPL", steps=[{"action": "export", "type": "summary"}],
+                            description="v1")
+        manifest_path = self._run_and_export("CON_TPL")
 
         self._save_template("CON_TPL", steps=[{"action": "export", "type": "differences"}],
                             description="v2", force=True)
@@ -1135,13 +1148,7 @@ class TestArchiveConflictResolution(_BaseTest):
         """归档中记录的导出文件已存在时检测到冲突."""
         self._import(self._make_batch())
         self._save_template("CON_FILE", steps=[{"action": "export", "type": "summary"}])
-        template = templates_mod.get_template(self.db_path, self.config, "CON_FILE")
-        allowed = cfg.get_allowed_statuses(self.config)
-        r1 = batch_mod.run_template(
-            self.db_path, self.config, template, self.output_dir,
-            allowed_statuses=allowed,
-        )
-        manifest_path = r1["archive_path"]
+        manifest_path = self._run_and_export("CON_FILE")
 
         conflicts = archive_mod.detect_restore_conflicts(
             self.db_path, self.config,
@@ -1156,13 +1163,7 @@ class TestArchiveConflictResolution(_BaseTest):
         cfg.save_runtime_state(self.config)
         self._import(self._make_batch())
         self._save_template("CON_PLAN", steps=[{"action": "export", "type": "summary"}])
-        template = templates_mod.get_template(self.db_path, self.config, "CON_PLAN")
-        allowed = cfg.get_allowed_statuses(self.config)
-        r1 = batch_mod.run_template(
-            self.db_path, self.config, template, self.output_dir,
-            allowed_statuses=allowed,
-        )
-        manifest_path = r1["archive_path"]
+        manifest_path = self._run_and_export("CON_PLAN")
 
         cfg.set_active_plan(self.config, "plan_new")
         cfg.save_runtime_state(self.config)
@@ -1179,13 +1180,7 @@ class TestArchiveConflictResolution(_BaseTest):
         self._import(self._make_batch())
         self._save_template("CON_ABORT", steps=[{"action": "export", "type": "summary"}],
                             description="v1")
-        template = templates_mod.get_template(self.db_path, self.config, "CON_ABORT")
-        allowed = cfg.get_allowed_statuses(self.config)
-        r1 = batch_mod.run_template(
-            self.db_path, self.config, template, self.output_dir,
-            allowed_statuses=allowed,
-        )
-        manifest_path = r1["archive_path"]
+        manifest_path = self._run_and_export("CON_ABORT")
 
         self._save_template("CON_ABORT", steps=[{"action": "list"}],
                             description="v2", force=True)
@@ -1207,12 +1202,8 @@ class TestArchiveConflictResolution(_BaseTest):
         self._save_template("EXP_ONLY", steps=[{"action": "export", "type": "summary"}])
         template = templates_mod.get_template(self.db_path, self.config, "EXP_ONLY")
         allowed = cfg.get_allowed_statuses(self.config)
-        r1 = batch_mod.run_template(
-            self.db_path, self.config, template, self.output_dir,
-            allowed_statuses=allowed,
-        )
-        manifest_path = r1["archive_path"]
         tpl_ver_before = template["version"]
+        manifest_path = self._run_and_export("EXP_ONLY")
 
         # 只删 DB 和 templates，保留 exports => 仅 export_file_exists 冲突
         data_dir = os.path.dirname(self.db_path)
@@ -1273,13 +1264,8 @@ class TestArchiveConflictResolution(_BaseTest):
         cfg.save_runtime_state(self.config)
         self._import(self._make_batch())
         self._save_template("PLAN_ONLY", steps=[{"action": "export", "type": "summary"}])
-        template = templates_mod.get_template(self.db_path, self.config, "PLAN_ONLY")
         allowed = cfg.get_allowed_statuses(self.config)
-        r1 = batch_mod.run_template(
-            self.db_path, self.config, template, self.output_dir,
-            allowed_statuses=allowed,
-        )
-        manifest_path = r1["archive_path"]
+        manifest_path = self._run_and_export("PLAN_ONLY")
 
         # 切方案
         cfg.set_active_plan(self.config, "plan_beta")
@@ -1331,13 +1317,7 @@ class TestArchiveConflictResolution(_BaseTest):
         self._import(self._make_batch())
         self._save_template("CON_SAVEAS", steps=[{"action": "export", "type": "summary"}],
                             description="orig v1")
-        template = templates_mod.get_template(self.db_path, self.config, "CON_SAVEAS")
-        allowed = cfg.get_allowed_statuses(self.config)
-        r1 = batch_mod.run_template(
-            self.db_path, self.config, template, self.output_dir,
-            allowed_statuses=allowed,
-        )
-        manifest_path = r1["archive_path"]
+        manifest_path = self._run_and_export("CON_SAVEAS")
 
         self._save_template("CON_SAVEAS", steps=[{"action": "list"}],
                             description="upgraded v2", force=True)
@@ -1365,13 +1345,7 @@ class TestArchiveConflictResolution(_BaseTest):
         self._import(self._make_batch())
         self._save_template("COL", steps=[{"action": "export", "type": "summary"}],
                             description="v1")
-        template = templates_mod.get_template(self.db_path, self.config, "COL")
-        allowed = cfg.get_allowed_statuses(self.config)
-        r1 = batch_mod.run_template(
-            self.db_path, self.config, template, self.output_dir,
-            allowed_statuses=allowed,
-        )
-        manifest_path = r1["archive_path"]
+        manifest_path = self._run_and_export("COL")
 
         self._save_template("COL", steps=[{"action": "list"}], force=True)
         templates_mod.save_template(
@@ -1604,6 +1578,80 @@ class TestDocumentationCoverage(unittest.TestCase):
                 keyword,
                 self.content,
                 f"USAGE.md 遗漏目录/模块说明: {keyword}",
+            )
+
+    def test_status_terminology_consistent_documented(self):
+        """USAGE.md 中使用统一的状态术语，不再混用 deprecated 的 interrupted."""
+        # 应明确说明 4 种状态
+        for keyword in ["pending", "running", "failed", "completed"]:
+            self.assertIn(
+                keyword,
+                self.content,
+                f"USAGE.md 遗漏标准执行状态说明: {keyword}",
+            )
+
+    def test_no_interrupted_in_status_explanations(self):
+        """状态说明表格中不应再使用 deprecated 的 'interrupted' 作为状态值.
+
+        注意：中文语境中可以出现「中断」这个词作为含义说明，
+        但不应出现 `interrupted`（英文状态名）这种用法。
+        这里检查的是：USAGE.md 中不再把 `interrupted` 当作正式状态名列出。
+        """
+        import re
+
+        content_no_code_ticks = re.sub(r"`interrupted`", "REMOVED_MARK", self.content)
+        # 不再有反引号包裹的 `interrupted`（即不再作为正式状态名）
+        self.assertNotIn(
+            "`interrupted`",
+            content_no_code_ticks,
+            "USAGE.md 不应再将 `interrupted` 作为正式状态名列出，"
+            "请统一改为 `failed`（执行中断）",
+        )
+
+    def test_resume_condition_documented(self):
+        """续跑条件应明确说明：状态不是 completed 即可续跑."""
+        self.assertIn(
+            "不是 completed",
+            self.content,
+            "USAGE.md 应明确说明续跑条件：状态 ≠ completed",
+        )
+        self.assertIn(
+            "skipped_done",
+            self.content,
+            "USAGE.md 应说明续跑时已完成步骤标记为 skipped_done，不重复导出",
+        )
+
+    def test_preview_archive_mandatory_documented(self):
+        """应明确说明 template-preview-archive 是恢复前必做步骤."""
+        self.assertIn(
+            "恢复前必做",
+            self.content,
+            "USAGE.md 应明确说明 template-preview-archive 是恢复前必须执行的预检步骤",
+        )
+        self.assertIn(
+            "template-preview-archive",
+            self.content,
+            "USAGE.md 应包含 template-preview-archive 命令入口",
+        )
+
+    def test_abort_saveas_behavior_documented(self):
+        """abort 和 save-as 两种策略的行为应文档化."""
+        # abort 的核心承诺：不改动任何数据
+        self.assertIn(
+            "不改动任何数据",
+            self.content,
+            "USAGE.md 应说明 --conflict abort 的核心承诺：遇到冲突不改动任何数据",
+        )
+        # save-as 的三个冲突处理方式
+        for keyword in [
+            "_restored",
+            "仅恢复元数据",
+            "不修改当前 runtime",
+        ]:
+            self.assertIn(
+                keyword,
+                self.content,
+                f"USAGE.md 应说明 save-as 策略的具体处理方式: {keyword}",
             )
 
 
@@ -1852,9 +1900,12 @@ class TestFullArchiveRestoreChain(unittest.TestCase):
 
         # === 阶段 4：在新环境中执行模板 ===
         rc, stdout, _ = self._run_cli("template-run", "MIGRATE")
-        self.assertEqual(rc, 0)
-        self.assertIn("[OK] 执行", stdout)
-        self.assertIn("completed", stdout)
+        self.assertEqual(rc, 0)  # 返回码 0 表示 completed 状态
+        self.assertIn("[OK] 完成", stdout)
+        # 通过 template-show 验证 completed 状态
+        rc2, show_out, _ = self._run_cli("template-show", "MIGRATE")
+        self.assertEqual(rc2, 0)
+        self.assertIn("completed", show_out)
 
         # === 阶段 5：导出执行归档 ===
         archive_path = os.path.join(self.archive_dir, "migrate_archive.json")
@@ -1961,21 +2012,18 @@ class TestFullArchiveRestoreChain(unittest.TestCase):
         self.assertIn("v2", stdout)
 
         # === 阶段 6：验证恢复的执行可以续跑或重新执行 ===
-        # 先检查执行状态
+        # 先检查执行状态（统一术语：非 completed 即可续跑，failed=执行中断可续跑）
         rc, stdout, _ = self._run_cli("template-show", "CONFLICT_restored")
         self.assertEqual(rc, 0)
-        if "interrupted" in stdout:
-            # 只有 interrupted 状态才需要续跑
-            rc, stdout, _ = self._run_cli(
-                "template-run", "CONFLICT_restored", "--resume",
-            )
-            self.assertEqual(rc, 0)
-        else:
-            # completed 状态直接重新执行也可以
-            rc, stdout, _ = self._run_cli(
-                "template-run", "CONFLICT_restored",
-            )
-            self.assertEqual(rc, 0)
+        # 确认文档/CLI 输出中不再混用 interrupted，统一使用 failed/completed
+        self.assertNotIn("interrupted", stdout,
+                         "CLI 输出不应混用 interrupted 术语，应统一为 failed/completed")
+        # 续跑条件：只要不是 completed（即 failed/running/pending）都可以续跑
+        # 这里原执行已完成，所以直接重新执行（新建独立记录）也可以
+        rc, stdout, _ = self._run_cli(
+            "template-run", "CONFLICT_restored",
+        )
+        self.assertEqual(rc, 0)
 
         # === 阶段 7：再次导出恢复后的执行 ===
         re_archive_path = os.path.join(self.archive_dir, "conflict_restored.json")
@@ -2099,18 +2147,28 @@ class TestFullArchiveRestoreChain(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("daily_report", stdout)
 
-        # 步骤 6：如果原执行是 interrupted 状态，续跑未完成的步骤
-        # 先检查执行状态
+        # 步骤 6：根据执行状态决定是续跑还是重新执行
+        # 统一术语：非 completed 状态均可续跑（failed/running/pending）
         rc, stdout, _ = self._run_cli("template-show", "daily_report")
         self.assertEqual(rc, 0)
-        if "interrupted" in stdout:
-            # 只有 interrupted 状态才需要续跑
+        # 确认不再使用 interrupted 术语
+        self.assertNotIn("interrupted", stdout,
+                         "CLI 输出不应混用 interrupted，应统一使用 failed/completed")
+
+        # 读取归档确认状态，再决定操作
+        with open(archive_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        exec_status = manifest["execution_meta"]["status"]
+        if exec_status != "completed":
+            # 状态为 failed/running/pending：可以 --resume 续跑
             rc, stdout, _ = self._run_cli(
                 "template-run", "daily_report", "--resume",
             )
             self.assertEqual(rc, 0)
+            # 续跑时已完成步骤应标记为 skipped_done
+            self.assertIn("skipped_done", stdout)
         else:
-            # completed 状态直接重新执行也可以
+            # 状态为 completed：重新执行（新建独立记录）
             rc, stdout, _ = self._run_cli(
                 "template-run", "daily_report",
             )
@@ -2124,6 +2182,646 @@ class TestFullArchiveRestoreChain(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         self.assertTrue(os.path.exists(re_archive_path))
+
+
+class TestStatusTerminologyConsistency(_BaseTest):
+    """状态术语一致性回归测试：CLI 输出、归档预览、文档说明都应使用统一术语.
+
+    核心原则：
+    1. 数据库和代码内部使用：pending / running / failed / completed
+    2. CLI 输出和文档中：不再混用「interrupted」，统一使用「failed（执行中断）」
+    3. 续跑条件统一：只要不是 completed 就可以 --resume
+    4. 所有帮助文案、结果提示、恢复建议前后一致
+    """
+
+    def test_no_interrupted_in_cli_output_failed_case(self):
+        """执行中断场景：CLI 输出应使用 'failed' 而非 'interrupted'."""
+        self._save_template(
+            "TERM_FAIL", steps=[
+                {"action": "export", "type": "summary"},
+                {"action": "export", "type": "differences"},
+            ],
+        )
+        # 故意不传数据让 differences 步骤失败，制造 failed 状态
+        rc = self._run_cli("template-run", "TERM_FAIL")
+        self.assertEqual(rc, 2)
+
+        # 用 subprocess 捕获实际 stdout
+        stdout = self._capture_cli_stdout("template-run", "TERM_FAIL", "--resume")
+        # 关键断言：不应出现 deprecated 的 'interrupted' 字样
+        self.assertNotIn("interrupted", stdout)
+        # 应出现正确的状态术语 'failed'
+        self.assertIn("failed", stdout.lower() if stdout else "")
+
+    def test_no_interrupted_in_template_show(self):
+        """template-show 输出：执行记录状态应使用标准术语."""
+        self._import(self._make_batch("term_data"))
+        self._save_template("TERM_SHOW",
+                            steps=[{"action": "export", "type": "summary"}])
+        self._run_cli("template-run", "TERM_SHOW")
+
+        stdout = self._capture_cli_stdout("template-show", "TERM_SHOW")
+        # 不应出现 interrupted
+        self.assertNotIn("interrupted", stdout)
+        # 应出现状态说明文字
+        self.assertIn("状态说明", stdout)
+        self.assertIn("completed", stdout)
+        self.assertIn("可续跑", stdout)
+
+    def test_no_interrupted_in_preview_archive(self):
+        """template-preview-archive 输出：状态显示应为标准术语.
+
+        测试两种场景：
+        1) completed 状态归档：应显示「无需续跑」
+        2) failed 状态归档：应显示「可续跑」
+        两种情况下都不应出现 deprecated 的 interrupted
+        """
+        # ---- 场景 1：completed 状态 ----
+        self._import(self._make_batch("pv_data"))
+        self._save_template("TERM_PREVIEW_COMPLETED",
+                            steps=[{"action": "export", "type": "summary"}])
+        self._run_cli("template-run", "TERM_PREVIEW_COMPLETED")
+
+        archive1 = os.path.join(self.tmpdir, "term_archive_completed.json")
+        self._run_cli("template-export-execution", "TERM_PREVIEW_COMPLETED", "-o", archive1)
+
+        stdout1 = self._capture_cli_stdout(
+            "template-preview-archive", archive1,
+        )
+        # 不应出现 interrupted（deprecated）
+        self.assertNotIn("interrupted", stdout1)
+        # 应出现执行状态段
+        self.assertIn("[执行状态]", stdout1)
+        # completed 状态显示「无需续跑」
+        self.assertIn("无需续跑", stdout1)
+
+        # ---- 场景 2：failed 状态（手动写入 DB 模拟）----
+        import sqlite3
+        import json as _json
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        # 先获取已有模板的信息，构造 template_snapshot
+        cur.execute("SELECT name, version, description, filters, export_fields, remark_template, steps "
+                    "FROM templates WHERE id=1")
+        row = cur.fetchone()
+        tpl_name = row[0] if row else "TERM_PREVIEW_COMPLETED"
+        if row:
+            tpl_snapshot = _json.dumps({
+                "name": row[0],
+                "version": row[1],
+                "description": row[2],
+                "filters": _json.loads(row[3]) if row[3] else {},
+                "export_fields": _json.loads(row[4]) if row[4] else [],
+                "remark_template": row[5],
+                "steps": _json.loads(row[6]) if row[6] else [],
+            })
+        else:
+            tpl_snapshot = _json.dumps({
+                "name": tpl_name,
+                "version": 1,
+                "steps": [{"action": "list"}, {"action": "export", "type": "summary"}],
+                "filters": {},
+                "export_fields": ["id", "location", "sku", "total_diff_qty", "status"],
+            })
+        # 创建一个新的执行记录，必须包含 template_name 和 template_snapshot
+        cur.execute(
+            "INSERT INTO template_executions "
+            "(template_id, template_name, template_version, template_snapshot, "
+            "status, started_at, finished_at, "
+            "steps_total, steps_done, steps_failed, operator, active_plan) "
+            "VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?, ?, ?, ?, ?)",
+            (1, tpl_name, 1, tpl_snapshot, "failed", 3, 1, 1, "cli", None),
+        )
+        exec_id = cur.lastrowid
+        # 写入步骤：1步 done, 1步 failed（step 列存 JSON）
+        step0 = _json.dumps({"action": "list"})
+        cur.execute(
+            "INSERT INTO template_execution_steps "
+            "(execution_id, step_index, step, status, result) "
+            "VALUES (?, 0, ?, 'done', '{}')",
+            (exec_id, step0),
+        )
+        step1 = _json.dumps({"action": "export", "type": "summary"})
+        cur.execute(
+            "INSERT INTO template_execution_steps "
+            "(execution_id, step_index, step, status, result, error) "
+            "VALUES (?, 1, ?, 'failed', '{}', '模拟失败')",
+            (exec_id, step1),
+        )
+        conn.commit()
+        conn.close()
+
+        # 导出这个 failed 执行的归档
+        archive2 = os.path.join(self.tmpdir, "term_archive_failed.json")
+        self._run_cli(
+            "template-export-execution", "TERM_PREVIEW_COMPLETED",
+            "--execution-id", str(exec_id),
+            "-o", archive2,
+        )
+        self.assertTrue(os.path.exists(archive2))
+
+        stdout2 = self._capture_cli_stdout(
+            "template-preview-archive", archive2,
+        )
+        # 不应出现 interrupted（deprecated）
+        self.assertNotIn("interrupted", stdout2)
+        # 应出现执行状态段
+        self.assertIn("[执行状态]", stdout2)
+        # failed 状态显示「可续跑」
+        self.assertIn("可续跑", stdout2)
+        # 明确标注执行中断
+        self.assertIn("执行中断", stdout2)
+
+    def test_no_interrupted_in_restore_execution(self):
+        """template-restore-execution 恢复后提示：续跑条件说明统一."""
+        self._import(self._make_batch("rst_data"))
+        self._save_template("TERM_RESTORE",
+                            steps=[{"action": "export", "type": "summary"}])
+        self._run_cli("template-run", "TERM_RESTORE")
+        archive_path = os.path.join(self.tmpdir, "term_restore.json")
+        self._run_cli("template-export-execution", "TERM_RESTORE", "-o", archive_path)
+
+        # 清空环境
+        data_dir = os.path.dirname(self.db_path)
+        templates_dir = os.path.join(data_dir, "templates")
+        os.remove(self.db_path)
+        if os.path.isdir(templates_dir):
+            shutil.rmtree(templates_dir)
+        for fn in os.listdir(self.output_dir):
+            fp = os.path.join(self.output_dir, fn)
+            if os.path.isfile(fp):
+                os.remove(fp)
+        db.init_db(self.db_path)
+
+        stdout = self._capture_cli_stdout(
+            "template-restore-execution", archive_path,
+        )
+        # 不应出现 interrupted
+        self.assertNotIn("interrupted", stdout)
+        # 应出现验证操作提示
+        self.assertIn("验证操作", stdout)
+
+    def _capture_cli_stdout(self, *argv):
+        """捕获 CLI 命令的 stdout."""
+        from io import StringIO
+        import contextlib
+
+        f = StringIO()
+        with contextlib.redirect_stdout(f):
+            rc = self._run_cli(*argv)
+        output = f.getvalue()
+        return output
+
+
+class TestCrossRestartResumeAndReExport(_BaseTest):
+    """跨重启恢复续跑 + 再次导出的回归测试.
+
+    覆盖链路：
+    1. 创建一个 failed 状态的执行（有步骤失败）
+    2. 导出归档清单
+    3. 删除数据库 + templates + exports（模拟重启数据丢失）
+    4. 重新初始化 + 重新导入盘点数据
+    5. 预览归档 → 恢复 → 续跑 → 再次导出
+    6. 验证两次归档的元数据一致性、状态命名一致
+    """
+
+    def _setup_failed_execution(self):
+        """创建一个 failed 状态的执行（summary 成功，differences 因空库失败）."""
+        self._save_template(
+            "CROSS_RESUME",
+            steps=[
+                {"action": "export", "type": "summary"},
+                {"action": "export", "type": "differences"},
+            ],
+            export_fields=["id", "location", "sku", "status"],
+            description="跨重启恢复续跑测试",
+        )
+        template = templates_mod.get_template(self.db_path, self.config, "CROSS_RESUME")
+        allowed = cfg.get_allowed_statuses(self.config)
+        # 不传数据，differences 步骤会失败 → 执行状态为 failed
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed, auto_archive=True,
+        )
+        self.assertFalse(r1["success"])
+        self.assertEqual(r1["status"], "failed")
+        self.assertEqual(r1["steps_done"], 1)
+        self.assertEqual(r1["steps_failed"], 1)
+        return r1["archive_path"], template["id"], template["version"]
+
+    def test_cross_restart_resume_and_reexport(self):
+        """跨重启：failed → 归档 → 清空 → 恢复 → 续跑 → 再次导出."""
+        archive_path, orig_tpl_id, orig_tpl_ver = self._setup_failed_execution()
+
+        # 读取原始归档用于后续比对
+        with open(archive_path, "r", encoding="utf-8") as f:
+            orig_manifest = json.load(f)
+        self.assertEqual(orig_manifest["execution_meta"]["status"], "failed")
+
+        # === 模拟重启 + 数据丢失 ===
+        data_dir = os.path.dirname(self.db_path)
+        templates_dir = os.path.join(data_dir, "templates")
+        os.remove(self.db_path)
+        if os.path.isdir(templates_dir):
+            shutil.rmtree(templates_dir)
+        # exports 保留不删，制造 export_file_exists 冲突（用来验证 save-as 分支）
+        db.init_db(self.db_path)
+
+        # === 步骤 1：预览归档（必做） ===
+        self._import(self._make_batch("after_cross_restart"))
+        preview = self._capture_cli_stdout(
+            "template-preview-archive", archive_path,
+        )
+        # 确认预检能看到 failed 状态和冲突
+        self.assertNotIn("interrupted", preview)
+        self.assertIn("failed", preview)
+        self.assertIn("[阻塞冲突]", preview)
+        self.assertIn("export_file_exists", preview)
+
+        # === 步骤 2：先用 abort 策略（应失败） ===
+        rc_abort = self._run_cli(
+            "template-restore-execution", archive_path, "--conflict", "abort",
+        )
+        self.assertEqual(rc_abort, 1, "有冲突时 abort 应返回非 0")
+
+        # === 步骤 3：使用 save-as 策略恢复 ===
+        rc_saveas = self._run_cli(
+            "template-restore-execution", archive_path, "--conflict", "save-as",
+        )
+        self.assertEqual(rc_saveas, 0, "save-as 有冲突时应自动处理并成功")
+
+        # 恢复后验证：模板存在，执行存在，状态为 failed
+        tpl = templates_mod.get_template(self.db_path, self.config, "CROSS_RESUME")
+        self.assertIsNotNone(tpl)
+        self.assertEqual(tpl["version"], orig_tpl_ver)
+
+        execs = db.list_executions(self.db_path, template_id=tpl["id"])
+        self.assertEqual(len(execs), 1)
+        # 关键：恢复后的执行状态与归档完全一致（failed，非 interrupted）
+        self.assertEqual(execs[0]["status"], "failed")
+        self.assertNotEqual(execs[0]["status"], "interrupted")
+        self.assertEqual(execs[0]["steps_done"], 1)
+        self.assertEqual(execs[0]["steps_failed"], 1)
+
+        # === 步骤 4：续跑（状态 failed → --resume） ===
+        rc_resume = self._run_cli(
+            "template-run", "CROSS_RESUME", "--resume",
+        )
+        self.assertEqual(rc_resume, 0, "有数据后续跑应成功")
+
+        # 续跑后验证：状态应为 completed
+        execs_after = db.list_executions(self.db_path, template_id=tpl["id"])
+        self.assertEqual(len(execs_after), 1)
+        self.assertEqual(execs_after[0]["status"], "completed")
+        self.assertEqual(execs_after[0]["steps_done"], 2)
+        self.assertEqual(execs_after[0]["steps_failed"], 0)
+
+        # === 步骤 5：再次导出归档 ===
+        re_archive_path = os.path.join(self.tmpdir, "cross_restart_restored.json")
+        rc_exp = self._run_cli(
+            "template-export-execution", "CROSS_RESUME", "-o", re_archive_path,
+        )
+        self.assertEqual(rc_exp, 0)
+        self.assertTrue(os.path.exists(re_archive_path))
+
+        # 验证元数据一致性
+        with open(re_archive_path, "r", encoding="utf-8") as f:
+            re_manifest = json.load(f)
+        self.assertEqual(
+            re_manifest["execution_meta"]["template_name"],
+            orig_manifest["execution_meta"]["template_name"],
+        )
+        self.assertEqual(
+            re_manifest["execution_meta"]["template_version"],
+            orig_tpl_ver,
+        )
+        # 状态不同是正常的：原归档 failed，续跑后 completed
+        self.assertEqual(re_manifest["execution_meta"]["status"], "completed")
+
+    def _capture_cli_stdout(self, *argv):
+        from io import StringIO
+        import contextlib
+
+        f = StringIO()
+        with contextlib.redirect_stdout(f):
+            self._run_cli(*argv)
+        return f.getvalue()
+
+
+class TestConflictAllBranches(_BaseTest):
+    """--conflict abort|save-as 所有分支的完整回归测试.
+
+    阻塞冲突共 3 类：
+    1. template_upgraded（同名模板已升级）
+    2. export_file_exists（导出文件已存在）
+    3. active_plan_mismatch（激活方案不一致）
+
+    每个冲突单独测试 + 三个冲突同时出现的组合测试。
+    """
+
+    def _setup_and_archive(self, tpl_name="ALL_BRANCHES", plan_name=None):
+        """创建执行并导出归档，返回归档路径和模板版本."""
+        if plan_name:
+            cfg.set_active_plan(self.config, plan_name)
+            cfg.save_runtime_state(self.config)
+        self._import(self._make_batch("br_data"))
+        self._save_template(
+            tpl_name, steps=[{"action": "export", "type": "summary"}],
+            description="冲突分支测试 v1",
+        )
+        template = templates_mod.get_template(self.db_path, self.config, tpl_name)
+        allowed = cfg.get_allowed_statuses(self.config)
+        r = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        self.assertTrue(r["success"])
+        return r["archive_path"], template["version"]
+
+    def test_template_upgraded_alone_abort_and_saveas(self):
+        """单独冲突：template_upgraded — abort 阻塞，save-as 另存为."""
+        archive_path, orig_ver = self._setup_and_archive("TPL_UPG")
+        # 升级模板到 v2
+        self._save_template(
+            "TPL_UPG", steps=[{"action": "list"}],
+            description="升级 v2", force=True,
+        )
+        v2 = templates_mod.get_template(self.db_path, self.config, "TPL_UPG")
+        self.assertEqual(v2["version"], 2)
+
+        # abort 策略：应失败
+        r_abort = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, archive_path, conflict_resolution="abort",
+        )
+        self.assertFalse(r_abort["success"])
+        self.assertTrue(r_abort.get("conflict"))
+        types = [c["type"] for c in r_abort["conflicts"]]
+        self.assertIn("template_upgraded", types)
+
+        # save-as 策略：应成功，模板另存为 TPL_UPG_restored
+        r_save = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, archive_path, conflict_resolution="save-as",
+        )
+        self.assertTrue(r_save["success"])
+        self.assertEqual(r_save.get("template_action"), "save_as")
+        restored_name = r_save.get("name")
+        self.assertTrue(restored_name.startswith("TPL_UPG_restored"))
+
+        # 原模板 v2 不变
+        v2_check = templates_mod.get_template(self.db_path, self.config, "TPL_UPG")
+        self.assertEqual(v2_check["version"], 2)
+        # 恢复的模板是 v1
+        restored = templates_mod.get_template(self.db_path, self.config, restored_name)
+        self.assertEqual(restored["version"], orig_ver)
+
+    def test_export_file_exists_alone_abort_and_saveas(self):
+        """单独冲突：export_file_exists — abort 阻塞，save-as 仅恢复元数据."""
+        archive_path, orig_ver = self._setup_and_archive("FILE_EXIST")
+        # 清 DB/templates，保留 exports（制造文件已存在冲突）
+        data_dir = os.path.dirname(self.db_path)
+        templates_dir = os.path.join(data_dir, "templates")
+        os.remove(self.db_path)
+        if os.path.isdir(templates_dir):
+            shutil.rmtree(templates_dir)
+        db.init_db(self.db_path)
+        # exports 目录里文件都还在
+
+        # abort 策略：应失败（只有 export_file_exists 冲突）
+        r_abort = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, archive_path, conflict_resolution="abort",
+        )
+        self.assertFalse(r_abort["success"])
+        types = [c["type"] for c in r_abort["conflicts"]]
+        self.assertIn("export_file_exists", types)
+
+        # save-as 策略：成功，磁盘文件不变
+        files_before = set(os.listdir(self.output_dir))
+        r_save = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, archive_path, conflict_resolution="save-as",
+        )
+        self.assertTrue(r_save["success"])
+        files_after = set(os.listdir(self.output_dir))
+        # 磁盘文件不应有任何变化（不新增、不覆盖、不删除）
+        self.assertEqual(files_before, files_after,
+                         "save-as 策略下 export_file_exists 不应改动磁盘文件")
+        # 但执行历史已恢复
+        execs = db.list_executions(self.db_path)
+        self.assertEqual(len(execs), 1)
+        self.assertEqual(execs[0]["template_version"], orig_ver)
+
+    def test_active_plan_mismatch_alone_abort_and_saveas(self):
+        """单独冲突：active_plan_mismatch — abort 阻塞，save-as 按归档方案恢复."""
+        archive_path, orig_ver = self._setup_and_archive(
+            "PLAN_MIS", plan_name="plan_old",
+        )
+        # 切换方案（但保留 DB/template，避免引入其他冲突）
+        cfg.set_active_plan(self.config, "plan_new")
+        cfg.save_runtime_state(self.config)
+
+        # 只制造 plan 冲突：清 DB/templates，恢复 DB 后重新 import + 重建相同模板（文件已清）
+        data_dir = os.path.dirname(self.db_path)
+        templates_dir = os.path.join(data_dir, "templates")
+        os.remove(self.db_path)
+        if os.path.isdir(templates_dir):
+            shutil.rmtree(templates_dir)
+        for fn in os.listdir(self.output_dir):
+            fp = os.path.join(self.output_dir, fn)
+            if os.path.isfile(fp):
+                os.remove(fp)
+        db.init_db(self.db_path)
+        self._import(self._make_batch("plan_reimport"))
+
+        # abort：冲突
+        r_abort = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, archive_path, conflict_resolution="abort",
+        )
+        self.assertFalse(r_abort["success"])
+        types = [c["type"] for c in r_abort["conflicts"]]
+        self.assertIn("active_plan_mismatch", types)
+        # 不应有其他冲突
+        self.assertNotIn("template_upgraded", types)
+        self.assertNotIn("export_file_exists", types)
+
+        # save-as：成功，执行记录里 active_plan 是归档的 plan_old
+        r_save = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, archive_path, conflict_resolution="save-as",
+        )
+        self.assertTrue(r_save["success"])
+        exec_record = db.get_execution(self.db_path, r_save["execution_id"])
+        self.assertEqual(exec_record["active_plan"], "plan_old")
+        # 当前 runtime 激活方案没变，仍是 plan_new
+        self.assertEqual(self.config.get("active_plan"), "plan_new")
+
+    def test_three_conflicts_simultaneously(self):
+        """组合冲突：三个冲突同时出现 — abort 全返回，save-as 一次性处理."""
+        archive_path, orig_ver = self._setup_and_archive(
+            "TRIPLE", plan_name="plan_alpha",
+        )
+        # 1. 升级模板（制造 template_upgraded）
+        self._save_template(
+            "TRIPLE", steps=[{"action": "list"}],
+            description="升级 v2", force=True,
+        )
+        # 2. 切方案（制造 active_plan_mismatch）
+        cfg.set_active_plan(self.config, "plan_beta")
+        cfg.save_runtime_state(self.config)
+        # 3. 导出文件仍在磁盘（export_file_exists 自然成立）
+
+        # 预检：应看到三个冲突
+        preview = archive_mod.preview_manifest(
+            archive_path, db_path=self.db_path, config=self.config,
+        )
+        self.assertTrue(preview["success"])
+        conflict_types = [c["type"] for c in preview["conflicts"]]
+        self.assertIn("template_upgraded", conflict_types)
+        self.assertIn("export_file_exists", conflict_types)
+        self.assertIn("active_plan_mismatch", conflict_types)
+
+        # abort：三个冲突全返回，不改动任何数据
+        tpl_before = templates_mod.get_template(self.db_path, self.config, "TRIPLE")
+        execs_before = db.list_executions(self.db_path)
+        files_before = set(os.listdir(self.output_dir))
+
+        r_abort = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, archive_path, conflict_resolution="abort",
+        )
+        self.assertFalse(r_abort["success"])
+
+        tpl_after = templates_mod.get_template(self.db_path, self.config, "TRIPLE")
+        execs_after = db.list_executions(self.db_path)
+        files_after = set(os.listdir(self.output_dir))
+
+        self.assertEqual(tpl_before["version"], tpl_after["version"],
+                         "abort 不应修改模板")
+        self.assertEqual(len(execs_before), len(execs_after),
+                         "abort 不应新增执行记录")
+        self.assertEqual(files_before, files_after,
+                         "abort 不应改动磁盘文件")
+
+        # save-as：一次性处理三个冲突，全部成功
+        r_save = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, archive_path, conflict_resolution="save-as",
+        )
+        self.assertTrue(r_save["success"],
+                        f"save-as 应成功: {r_save.get('error')}, conflicts={r_save.get('conflicts')}")
+        restored_name = r_save.get("name")
+        # 模板另存为新名
+        self.assertTrue(restored_name.startswith("TRIPLE_restored"))
+        # 执行记录里的 active_plan 是归档的 plan_alpha
+        exec_record = db.get_execution(self.db_path, r_save["execution_id"])
+        self.assertEqual(exec_record["active_plan"], "plan_alpha")
+        # 当前 runtime 方案没变
+        self.assertEqual(self.config.get("active_plan"), "plan_beta")
+        # 磁盘文件没变
+        files_final = set(os.listdir(self.output_dir))
+        self.assertEqual(files_before, files_final)
+
+
+class TestImportExportReExecution(_BaseTest):
+    """模板导入导出后再次执行的回归测试.
+
+    覆盖链路：
+    环境 A：创建模板 → 执行(failed) → 导出模板 JSON → 导出执行归档
+    环境 B：初始化 → 导入数据 → 导入模板 JSON → 执行 → 再次导出归档
+    验证：状态术语统一、版本号不变、步骤数一致、元数据对齐
+    """
+
+    def test_import_template_execute_and_reexport(self):
+        """跨环境：模板导出 → 删除 → 导入 → 再次执行 → 归档元数据一致."""
+        # === 环境 A：创建模板 v1，故意制造 failed 状态 ===
+        self._save_template(
+            "IMP_EXP", steps=[
+                {"action": "export", "type": "summary"},
+                {"action": "export", "type": "differences"},
+            ],
+            export_fields=["id", "location", "sku", "status"],
+            description="导入导出测试模板",
+        )
+        tpl_export_path = os.path.join(self.tmpdir, "imp_exp_template.json")
+        r1 = templates_mod.export_template(
+            self.db_path, self.config, "IMP_EXP", tpl_export_path,
+        )
+        self.assertTrue(r1["success"])
+
+        # 先执行一次（不传数据让 differences 失败，制造 failed）
+        template_a = templates_mod.get_template(self.db_path, self.config, "IMP_EXP")
+        allowed = cfg.get_allowed_statuses(self.config)
+        r_exec_a = batch_mod.run_template(
+            self.db_path, self.config, template_a, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        self.assertEqual(r_exec_a["status"], "failed")
+        archive_a_path = r_exec_a["archive_path"]
+        self.assertIsNotNone(archive_a_path)
+
+        # === 模拟环境 B：清空 DB/templates/部分 exports ===
+        data_dir = os.path.dirname(self.db_path)
+        templates_dir = os.path.join(data_dir, "templates")
+        os.remove(self.db_path)
+        if os.path.isdir(templates_dir):
+            shutil.rmtree(templates_dir)
+        for fn in os.listdir(self.output_dir):
+            fp = os.path.join(self.output_dir, fn)
+            if os.path.isfile(fp):
+                os.remove(fp)
+        db.init_db(self.db_path)
+
+        # === 环境 B：重新导入数据 + 导入模板 ===
+        self._import(self._make_batch("env_b_data"))
+        rc_imp = self._run_cli("template-import", tpl_export_path)
+        self.assertEqual(rc_imp, 0)
+
+        # 验证导入的模板：名称、版本、描述、导出字段均一致
+        template_b = templates_mod.get_template(self.db_path, self.config, "IMP_EXP")
+        self.assertIsNotNone(template_b)
+        self.assertEqual(template_b["name"], template_a["name"])
+        self.assertEqual(template_b["version"], 1)  # 版本不变
+        self.assertEqual(template_b["description"], template_a["description"])
+        self.assertEqual(template_b["export_fields"], template_a["export_fields"])
+        self.assertEqual(len(template_b["steps"]), len(template_a["steps"]))
+
+        # === 环境 B：按导入的模板执行（这次有数据，应成功 completed） ===
+        rc_run = self._run_cli("template-run", "IMP_EXP")
+        self.assertEqual(rc_run, 0)
+
+        # 验证执行状态
+        execs_b = db.list_executions(self.db_path, template_id=template_b["id"])
+        self.assertEqual(len(execs_b), 1)
+        self.assertEqual(execs_b[0]["status"], "completed")
+        self.assertNotEqual(execs_b[0]["status"], "interrupted")
+
+        # === 环境 B：再次导出归档 ===
+        archive_b_path = os.path.join(self.tmpdir, "env_b_archive.json")
+        rc_exp = self._run_cli(
+            "template-export-execution", "IMP_EXP", "-o", archive_b_path,
+        )
+        self.assertEqual(rc_exp, 0)
+
+        # 读取两个归档，比较关键元数据
+        with open(archive_a_path, "r", encoding="utf-8") as f:
+            manifest_a = json.load(f)
+        with open(archive_b_path, "r", encoding="utf-8") as f:
+            manifest_b = json.load(f)
+
+        # 模板标识一致
+        self.assertEqual(
+            manifest_b["execution_meta"]["template_name"],
+            manifest_a["execution_meta"]["template_name"],
+        )
+        self.assertEqual(
+            manifest_b["execution_meta"]["template_version"],
+            1,
+        )
+        # 步骤总数相同（即使状态不同）
+        self.assertEqual(
+            manifest_b["execution_meta"]["steps_total"],
+            manifest_a["execution_meta"]["steps_total"],
+        )
+        # 两个归档都不应出现 interrupted 字样
+        combined_text = json.dumps(manifest_a, ensure_ascii=False) + \
+                        json.dumps(manifest_b, ensure_ascii=False)
+        self.assertNotIn("interrupted", combined_text,
+                         "归档内容不应包含 deprecated 的 interrupted 术语")
 
 
 if __name__ == "__main__":

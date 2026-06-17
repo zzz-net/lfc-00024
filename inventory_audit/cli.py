@@ -774,15 +774,24 @@ def cmd_template_show(args) -> int:
 
     execs = db.list_executions(db_path, template_id=template["id"])
     if execs:
-        print(f"\n执行记录 ({len(execs)} 条):")
+        print(f"\n执行记录 ({len(execs)} 条) — 状态说明: completed=[OK]已完成 / failed=[!!]中断可续跑 / running=[>>]执行中 / pending=[..]待执行")
         for e in execs:
+            status = e.get("status", "?")
+            status_cn = {
+                "completed": "[OK]已完成",
+                "failed": "[!!]中断(可续跑)",
+                "running": "[>>]执行中",
+                "pending": "[..]待执行",
+            }.get(status, status)
             op_part = f" op={e.get('operator') or '-'}"
             plan_part = f" plan={e.get('active_plan') or '-'}"
             print(f"  #{e['id']} v{e.get('template_version')} "
-                  f"{e.get('status')} "
+                  f"{status_cn:<16} "
                   f"完成 {e.get('steps_done')}/{e.get('steps_total')} "
                   f"失败 {e.get('steps_failed')}"
                   f"{op_part}{plan_part}")
+            if status != "completed":
+                print(f"         → 可续跑: template-run {template['name']} --execution-id {e['id']}")
     return 0
 
 
@@ -882,8 +891,13 @@ def cmd_template_run(args) -> int:
 
     status = result["status"]
     eid = result["execution_id"]
-    print(f"[{'OK' if status == 'completed' else 'INTERRUPT'}] "
-          f"执行 #{eid} {status}："
+    status_label = {
+        "completed": "[OK] 完成",
+        "failed": "[FAILED] 执行中断",
+        "running": "[RUNNING] 执行中",
+        "pending": "[PENDING] 待执行",
+    }.get(status, f"[{status.upper()}]")
+    print(f"{status_label} 执行 #{eid}："
           f"完成 {result['steps_done']}/{result['steps_total']}，"
           f"失败 {result['steps_failed']}")
     for s in result["steps"]:
@@ -911,13 +925,12 @@ def cmd_template_run(args) -> int:
     print(f"  导出执行归档: template-export-execution {name}")
     if status != "completed":
         print(f"  续跑未完成步骤: template-run {name} --resume")
-    else:
-        print(f"  重新执行（新建执行记录）: template-run {name}")
-
-    if status != "completed":
-        print(f"\n[提示] 使用 'template-run {name} --resume' 续跑（已完成步骤不会重复执行）")
+        print(f"\n[续跑条件] 当前状态为「{status}」，非 completed 状态均可续跑；"
+              f"已完成步骤会标记为 skipped_done，不会重复产生日志或导出文件。")
         return 2
-    return 0
+    else:
+        print(f"  重新执行（新建独立执行记录）: template-run {name}")
+        return 0
 
 
 def cmd_template_export_execution(args) -> int:
@@ -1037,8 +1050,8 @@ def cmd_template_preview_archive(args) -> int:
         label = s["action"] + (f"/{s['detail']}" if s['detail'] else "")
         status_label = {
             "done": "[完成]",
-            "failed": "[失败]",
-            "skipped_done": "[跳过]",
+            "failed": "[失败/中断]",
+            "skipped_done": "[跳过/已完成]",
             "pending": "[待执行]",
             "running": "[运行中]",
         }.get(s["status"], f"[{s['status']}]")
@@ -1047,6 +1060,21 @@ def cmd_template_preview_archive(args) -> int:
         print(f"  #{s['index']:2d} {status_label} {label}{extra}")
         if error:
             print(f"       错误: {error}")
+    print()
+
+    exec_status = exec_info.get("status", "")
+    resumable = exec_status != "completed"
+    status_cn = {
+        "running": "执行中（可续跑）",
+        "failed": "执行中断（可续跑）",
+        "pending": "待执行（可续跑）",
+        "completed": "已完成（无需续跑）",
+    }.get(exec_status, exec_status)
+    print(f"[执行状态] {exec_status} — {status_cn}")
+    if resumable:
+        print("  → 非 completed 状态均可续跑，续跑时已完成步骤标记为 skipped_done，不重复导出")
+    else:
+        print("  → 已全部完成；如需重新执行，请新建执行记录")
     print()
 
     if p["export_files"]:
@@ -1171,15 +1199,30 @@ def cmd_template_restore_execution(args) -> int:
         print(f"  操作日志恢复: {result['logs_restored']} 条")
 
     exec_status = exec_info.get("status", "")
-    if exec_status in ("running", "failed", "interrupted"):
+    resumable = exec_status != "completed"
+    if resumable:
         print()
-        print(f"[提示] 原执行状态为「{exec_status}」，可使用以下命令续跑：")
-        print(f"  template-run {tpl.get('name')} --resume")
+        status_cn = {
+            "running": "执行中",
+            "failed": "执行中断",
+            "pending": "待执行",
+        }.get(exec_status, exec_status)
+        print(f"[续跑条件] 原执行状态为「{exec_status}（{status_cn}）」，"
+              f"非 completed 状态均可续跑。已完成步骤在续跑时会标记为 skipped_done，"
+              f"不会重复产生日志或导出文件。")
+        print(f"  续跑命令: template-run {tpl.get('name')} --resume")
+    else:
+        print()
+        print(f"[状态] 原执行状态为「completed（已完成）」，无需续跑。"
+              f"如需重新执行，请新建执行记录。")
     print()
-    print("[提示] 恢复后可执行以下验证操作：")
-    print(f"  template-show {tpl.get('name')}          # 查看模板和执行记录")
-    print(f"  template-run {tpl.get('name')} --resume  # 如有未完成步骤可续跑")
-    print(f"  template-export-execution {tpl.get('name')}  # 再次导出归档核对")
+    print("[验证操作] 恢复后可执行以下操作确认状态一致：")
+    print(f"  template-show {tpl.get('name')}              # 查看模板和执行记录（状态/步骤统计）")
+    if resumable:
+        print(f"  template-run {tpl.get('name')} --resume      # 续跑未完成步骤")
+    else:
+        print(f"  template-run {tpl.get('name')}               # 重新执行（新建独立执行记录）")
+    print(f"  template-export-execution {tpl.get('name')}  # 再次导出归档，核对元数据")
     return 0
 
 
@@ -1352,51 +1395,59 @@ def build_parser() -> argparse.ArgumentParser:
     p_tpl_export.set_defaults(func=cmd_template_export)
 
     p_tpl_run = subparsers.add_parser(
-        "template-run", help="按模板批量执行 list/export/replay（支持续跑）",
+        "template-run",
+        help="按模板批量执行（支持续跑）。执行状态：completed/failed/running/pending，非 completed 均可续跑",
     )
     p_tpl_run.add_argument("name", help="模板名称")
     p_tpl_run.add_argument(
-        "--execution-id", type=int, default=None, help="续跑指定执行记录 ID",
+        "--execution-id", type=int, default=None,
+        help="续跑指定执行记录 ID；与该 ID 状态无关，只要不是 completed 就从失败/待执行步骤继续",
     )
     p_tpl_run.add_argument(
-        "--resume", action="store_true", help="续跑最近一次未完成的执行",
+        "--resume", action="store_true",
+        help="自动选择最近一条状态非 completed 的执行记录续跑；已完成步骤标记为 skipped_done，不重复导出",
     )
     p_tpl_run.set_defaults(func=cmd_template_run)
 
     p_tpl_export_exec = subparsers.add_parser(
         "template-export-execution",
-        help="导出执行归档清单（含模板快照、步骤结果、operator、激活方案）",
+        help="导出执行归档清单（含模板快照、步骤状态、导出文件、操作日志），用于跨环境恢复和续跑",
     )
     p_tpl_export_exec.add_argument(
-        "name", nargs="?", default=None, help="模板名称（取最近执行）",
+        "name", nargs="?", default=None, help="模板名称（默认取最近一条执行）",
     )
     p_tpl_export_exec.add_argument(
         "-e", "--execution-id", type=int, default=None, help="指定执行记录 ID（优先于模板名）",
     )
     p_tpl_export_exec.add_argument(
-        "-o", "--output", default=None, help="输出文件路径(JSON)，默认 archives/ 目录",
+        "-o", "--output", default=None, help="输出文件路径(JSON)，默认 archives/exec_{id}_{tpl}_{ts}.json",
     )
     p_tpl_export_exec.set_defaults(func=cmd_template_export_execution)
 
     p_tpl_preview_archive = subparsers.add_parser(
         "template-preview-archive",
-        help="预检/预览归档清单（不执行恢复，先看清内容和冲突）",
+        help="【恢复前必做】预检归档：查看执行状态、步骤、导出文件、冲突检测，不执行任何恢复",
     )
     p_tpl_preview_archive.add_argument("file", help="归档清单文件路径(JSON)")
     p_tpl_preview_archive.add_argument(
         "--no-conflict-check", action="store_true",
-        help="不检测冲突，仅查看归档内容（离线场景使用）",
+        help="仅离线预览内容，不连接数据库检测冲突（不验证模板升级/文件存在/方案一致）",
     )
     p_tpl_preview_archive.set_defaults(func=cmd_template_preview_archive)
 
     p_tpl_restore_exec = subparsers.add_parser(
         "template-restore-execution",
-        help="从归档清单恢复执行历史（支持冲突检测与处理）",
+        help="从归档恢复执行历史 + 模板快照。恢复后 failed 状态可 --resume 续跑，completed 可重执行",
     )
     p_tpl_restore_exec.add_argument("file", help="归档清单文件路径(JSON)")
     p_tpl_restore_exec.add_argument(
         "--conflict", choices=["abort", "save-as"], default="abort",
-        help="冲突处理策略：abort(中止,默认) / save-as(另存为新模板名)",
+        help=(
+            "冲突处理策略："
+            "abort(中止,默认) — 检测到任意阻塞冲突立即中止，不改动任何数据；"
+            "save-as(自动处理) — 模板升级则另存为 <name>_restored，导出文件已存在则仅恢复元数据不覆盖磁盘，"
+            "方案不一致则按归档记录恢复执行且不改动当前 runtime 激活方案"
+        ),
     )
     p_tpl_restore_exec.set_defaults(func=cmd_template_restore_execution)
 

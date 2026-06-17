@@ -428,10 +428,24 @@ def preview_manifest(
             suggestion_parts.append("未检测到冲突，可直接恢复。")
 
         exec_status = meta.get("status", "")
-        if exec_status in ("running", "failed", "interrupted"):
+        resumable = exec_status != "completed"
+        tpl_name = snap.get("name") or meta.get("template_name")
+        if resumable:
+            status_cn = {
+                "running": "执行中",
+                "failed": "执行中断",
+                "pending": "待执行",
+            }.get(exec_status, exec_status)
             suggestion_parts.append(
-                f"原执行状态为「{exec_status}」，恢复后可使用 "
-                f"'template-run {snap.get('name') or meta.get('template_name')} --resume' 续跑。"
+                f"原执行状态为「{exec_status}（{status_cn}）」，"
+                f"非 completed 状态均可续跑。恢复后可使用 "
+                f"'template-run {tpl_name} --resume' 续跑，"
+                f"已完成步骤标记为 skipped_done，不重复产生日志或导出文件。"
+            )
+        else:
+            suggestion_parts.append(
+                f"原执行状态为「completed（已完成）」，无需续跑。"
+                f"如需重新执行，请运行 'template-run {tpl_name}' 新建执行记录。"
             )
         suggestion_parts.append(
             f"恢复命令：template-restore-execution {os.path.basename(manifest_path)} "
