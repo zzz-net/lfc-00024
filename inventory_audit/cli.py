@@ -890,16 +890,29 @@ def cmd_template_run(args) -> int:
         step = s["step"]
         label = step.get("action") + (f"/{step.get('type')}" if step.get("type") else "")
         if s["status"] == "skipped_done":
-            print(f"  #{s['step_index']} {label}: 跳过（已完成，未重复执行）")
+            r = s.get("result", {})
+            extra = f" -> {os.path.basename(r.get('file_path'))}" if r.get("file_path") else ""
+            print(f"  #{s['step_index']} {label}: 跳过（已完成，未重复执行）{extra}")
         elif s["status"] == "done":
             r = s.get("result", {})
             extra = f" -> {r.get('file_path')}" if r.get("file_path") else ""
+            if r.get("count") is not None:
+                extra += f" ({r['count']} 条)"
             print(f"  #{s['step_index']} {label}: 完成{extra}")
         else:
             print(f"  #{s['step_index']} {label}: 失败 - {s.get('error')}")
 
     if result.get("archive_path"):
         print(f"\n[归档] 执行清单已导出: {result['archive_path']}")
+
+    print()
+    print("[后续操作]")
+    print(f"  查看执行详情: template-show {name}")
+    print(f"  导出执行归档: template-export-execution {name}")
+    if status != "completed":
+        print(f"  续跑未完成步骤: template-run {name} --resume")
+    else:
+        print(f"  重新执行（新建执行记录）: template-run {name}")
 
     if status != "completed":
         print(f"\n[提示] 使用 'template-run {name} --resume' 续跑（已完成步骤不会重复执行）")
@@ -949,6 +962,129 @@ def cmd_template_export_execution(args) -> int:
     export_count = len(manifest.get("export_files", []))
     if export_count:
         print(f"  相关导出文件: {export_count} 个")
+        for ef in manifest.get("export_files", [])[:3]:
+            print(f"    - {ef.get('filename')}")
+        if export_count > 3:
+            print(f"    ... 还有 {export_count - 3} 个")
+    print()
+    print("[后续操作]")
+    print(f"  预览归档内容: template-preview-archive {os.path.basename(result['file_path'])}")
+    print(f"  从归档恢复: template-restore-execution {os.path.basename(result['file_path'])}")
+    print(f"  查看模板详情: template-show {meta.get('template_name')}")
+    return 0
+
+
+def cmd_template_preview_archive(args) -> int:
+    """预检/预览归档清单（不执行恢复，先看清内容和冲突）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    manifest_file = args.file
+    check_conflicts = not getattr(args, "no_conflict_check", False)
+
+    if check_conflicts:
+        result = archive_mod.preview_manifest(
+            manifest_file, db_path=db_path, config=config,
+        )
+    else:
+        result = archive_mod.preview_manifest(manifest_file)
+
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error')}")
+        return 1
+
+    p = result["preview"]
+    exec_info = p["execution"]
+    tpl_info = p["template"]
+
+    print("=" * 70)
+    print("=== 归档清单预览 ===")
+    print("=" * 70)
+    print(f"文件: {p['manifest_file']}")
+    print(f"导出版本: v{p['manifest_version']}，导出时间: {p['exported_at']}")
+    print()
+
+    print("--- 执行信息 ---")
+    print(f"  原执行 ID: #{exec_info['id']}")
+    print(f"  状态: {exec_info['status']}")
+    print(f"  开始: {exec_info['started_at']}")
+    if exec_info['finished_at']:
+        print(f"  结束: {exec_info['finished_at']}")
+    print(f"  步骤: 完成 {exec_info['steps_done']}/{exec_info['steps_total']}，"
+          f"失败 {exec_info['steps_failed']}")
+    print(f"  操作人: {p['operator'] or '-'}")
+    print(f"  激活方案: {p['active_plan'] or '-'}")
+    print()
+
+    print("--- 模板快照 ---")
+    print(f"  名称: {tpl_info['name']}")
+    print(f"  版本: v{tpl_info['version']}")
+    if tpl_info.get('description'):
+        print(f"  描述: {tpl_info['description']}")
+    print(f"  内容指纹: {tpl_info['content_hash']}")
+    f = tpl_info["filters"]
+    print(f"  筛选: status={f['status'] or '-'}, "
+          f"location={f['location'] or '-'}, sku={f['sku'] or '-'}")
+    if tpl_info.get('export_fields'):
+        print(f"  导出字段: {', '.join(tpl_info['export_fields'])}")
+    if tpl_info.get('remark_template'):
+        print(f"  备注模板: {tpl_info['remark_template']}")
+    print()
+
+    print("--- 执行步骤 ---")
+    for s in p["steps"]:
+        label = s["action"] + (f"/{s['detail']}" if s['detail'] else "")
+        status_label = {
+            "done": "[完成]",
+            "failed": "[失败]",
+            "skipped_done": "[跳过]",
+            "pending": "[待执行]",
+            "running": "[运行中]",
+        }.get(s["status"], f"[{s['status']}]")
+        extra = s.get("extra", "")
+        error = s.get("error")
+        print(f"  #{s['index']:2d} {status_label} {label}{extra}")
+        if error:
+            print(f"       错误: {error}")
+    print()
+
+    if p["export_files"]:
+        print("--- 导出文件 ---")
+        for ef in p["export_files"]:
+            size_note = ""
+            if ef.get("file_size") is not None:
+                size_note = f" ({ef['file_size']} bytes)"
+            exists_note = "" if ef.get("file_exists") else " (文件已丢失)"
+            print(f"  步骤#{ef['step_index']} [{ef['type']}] "
+                  f"{ef['filename']}{size_note}{exists_note}")
+        print()
+
+    print(f"相关操作日志: {p['operation_logs_count']} 条")
+    print()
+
+    if check_conflicts and result.get("conflicts"):
+        print("--- 恢复冲突检测 ---")
+        blocking = [c for c in result["conflicts"]
+                    if c["type"] in archive_mod.BLOCKING_CONFLICT_TYPES]
+        non_blocking = [c for c in result["conflicts"]
+                        if c["type"] not in archive_mod.BLOCKING_CONFLICT_TYPES]
+        if blocking:
+            print(f"[阻塞冲突] 共 {len(blocking)} 项，需处理后才能恢复：")
+            for c in blocking:
+                print(f"  ! [{c['type']}] {c['message']}")
+                if c.get("resolution"):
+                    print(f"      → save-as 处理方式: {c['resolution']}")
+        if non_blocking:
+            print(f"[提示冲突] 共 {len(non_blocking)} 项，不阻塞恢复：")
+            for c in non_blocking:
+                print(f"  - [{c['type']}] {c['message']}")
+                if c.get("resolution"):
+                    print(f"      → 处理方式: {c['resolution']}")
+        print()
+
+    print(f"[建议] {result.get('suggestion', '')}")
+    print("=" * 70)
     return 0
 
 
@@ -961,15 +1097,49 @@ def cmd_template_restore_execution(args) -> int:
     manifest_file = args.file
     resolution = getattr(args, "conflict", "abort")
 
+    print(f"[INFO] 正在加载归档: {os.path.basename(manifest_file)}")
+    preview = archive_mod.preview_manifest(
+        manifest_file, db_path=db_path, config=config,
+    )
+    if not preview.get("success"):
+        print(f"[ERROR] {preview.get('error')}")
+        return 1
+
+    p = preview["preview"]
+    exec_info = p["execution"]
+    tpl_info = p["template"]
+    print(f"[INFO] 原执行 #{exec_info['id']}: {tpl_info['name']} v{tpl_info['version']} "
+          f"({exec_info['status']}, 完成 {exec_info['steps_done']}/{exec_info['steps_total']})")
+
+    if preview.get("conflicts"):
+        blocking = [c for c in preview["conflicts"]
+                    if c["type"] in archive_mod.BLOCKING_CONFLICT_TYPES]
+        if blocking:
+            print(f"[WARN] 检测到 {len(blocking)} 项阻塞冲突:")
+            for c in blocking[:5]:
+                print(f"  - [{c['type']}] {c['message']}")
+            if len(blocking) > 5:
+                print(f"  ... 还有 {len(blocking) - 5} 项")
+            if resolution == "abort":
+                print("[INFO] 使用 --conflict save-as 可自动处理这些冲突")
+
     result = archive_mod.restore_execution_from_manifest(
         db_path, config, manifest_file, conflict_resolution=resolution,
     )
 
     if not result.get("success"):
         if result.get("conflicts"):
-            print("[冲突] 恢复前检测到以下问题：")
+            print("[冲突] 恢复中止，检测到以下阻塞冲突：")
             for c in result["conflicts"]:
-                print(f"  [{c.get('type')}] {c.get('message')}")
+                severity = "!" if c.get("severity") == "error" else "-"
+                print(f"  {severity} [{c.get('type')}] {c.get('message')}")
+                if c.get("resolution"):
+                    print(f"      → save-as 处理方式: {c['resolution']}")
+            print()
+            print("  可用冲突处理策略：")
+            print("    --conflict abort    : 中止（默认），不改动任何数据")
+            print("    --conflict save-as  : 自动处理上述所有冲突 - 模板另存为新名、")
+            print("                          保留现有文件、按归档记录恢复方案")
         err = result.get("error") or "恢复失败"
         if result.get("template_conflict"):
             print(f"[冲突] {err}")
@@ -979,9 +1149,12 @@ def cmd_template_restore_execution(args) -> int:
         return 1
 
     if result.get("conflicts"):
-        print("[提示] 恢复时检测到非阻塞冲突：")
-        for c in result["conflicts"]:
-            print(f"  [{c.get('type')}] {c.get('message')}")
+        non_blocking = [c for c in result["conflicts"]
+                        if c["type"] not in archive_mod.BLOCKING_CONFLICT_TYPES]
+        if non_blocking:
+            print("[提示] 恢复时检测到非阻塞冲突：")
+            for c in non_blocking:
+                print(f"  - [{c.get('type')}] {c.get('message')}")
 
     tpl = result.get("template") or {}
     print(f"[OK] 执行历史已恢复")
@@ -994,6 +1167,19 @@ def cmd_template_restore_execution(args) -> int:
     print(f"  模板: {tpl.get('name')} v{tpl.get('version')}{name_note}")
     print(f"  步骤数: {result.get('steps_restored', 0)}")
     print(f"  操作人: {config.get('operator', 'cli')}")
+    if result.get("logs_restored", 0) > 0:
+        print(f"  操作日志恢复: {result['logs_restored']} 条")
+
+    exec_status = exec_info.get("status", "")
+    if exec_status in ("running", "failed", "interrupted"):
+        print()
+        print(f"[提示] 原执行状态为「{exec_status}」，可使用以下命令续跑：")
+        print(f"  template-run {tpl.get('name')} --resume")
+    print()
+    print("[提示] 恢复后可执行以下验证操作：")
+    print(f"  template-show {tpl.get('name')}          # 查看模板和执行记录")
+    print(f"  template-run {tpl.get('name')} --resume  # 如有未完成步骤可续跑")
+    print(f"  template-export-execution {tpl.get('name')}  # 再次导出归档核对")
     return 0
 
 
@@ -1191,6 +1377,17 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--output", default=None, help="输出文件路径(JSON)，默认 archives/ 目录",
     )
     p_tpl_export_exec.set_defaults(func=cmd_template_export_execution)
+
+    p_tpl_preview_archive = subparsers.add_parser(
+        "template-preview-archive",
+        help="预检/预览归档清单（不执行恢复，先看清内容和冲突）",
+    )
+    p_tpl_preview_archive.add_argument("file", help="归档清单文件路径(JSON)")
+    p_tpl_preview_archive.add_argument(
+        "--no-conflict-check", action="store_true",
+        help="不检测冲突，仅查看归档内容（离线场景使用）",
+    )
+    p_tpl_preview_archive.set_defaults(func=cmd_template_preview_archive)
 
     p_tpl_restore_exec = subparsers.add_parser(
         "template-restore-execution",

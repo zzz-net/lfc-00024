@@ -229,6 +229,8 @@ def detect_restore_conflicts(
     - template_upgraded: 同名模板已存在且版本/内容不一致
     - export_file_exists: 归档中的导出文件已存在于磁盘（会被误覆盖/混淆）
     - active_plan_mismatch: 当前激活方案与归档记录不一致
+
+    每个冲突包含 resolution 字段，说明使用 --conflict save-as 时的处理方式。
     """
     conflicts: List[Dict[str, Any]] = []
     snap = manifest.get("template_snapshot") or {}
@@ -249,6 +251,10 @@ def detect_restore_conflicts(
                     f"归档 v{snap_version}（hash {snap_hash[:12] if snap_hash else '?'}）vs "
                     f"当前 v{cur_version}（hash {cur_hash[:12] if cur_hash else '?'}）"
                 ),
+                "resolution": (
+                    f"使用 --conflict save-as 将另存为新模板 "
+                    f"「{tpl_name}_restored」，不影响现有模板"
+                ),
                 "template_name": tpl_name,
                 "archived_version": snap_version,
                 "current_version": cur_version,
@@ -261,6 +267,7 @@ def detect_restore_conflicts(
                 "type": "export_file_exists",
                 "severity": "error",
                 "message": f"导出文件已存在：{fp}",
+                "resolution": "使用 --conflict save-as 将仅恢复元数据，不覆盖磁盘现有文件",
                 "file_path": fp,
                 "filename": ef.get("filename"),
             })
@@ -274,6 +281,11 @@ def detect_restore_conflicts(
             "message": (
                 f"激活方案不一致：归档记录 {archived_plan or '(无)'} vs "
                 f"当前 {current_plan or '(无)'}"
+            ),
+            "resolution": (
+                f"使用 --conflict save-as 将按归档记录的方案 "
+                f"「{archived_plan or '(无)'}」恢复执行记录，"
+                f"不改动当前运行时激活方案「{current_plan or '(无)'}」"
             ),
             "archived_plan": archived_plan,
             "current_plan": current_plan,
@@ -293,6 +305,155 @@ SAVEAS_RESOLVABLE_TYPES = frozenset({
     "export_file_exists",
     "active_plan_mismatch",
 })
+
+
+def preview_manifest(
+    manifest_path: str,
+    db_path: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """预检/预览归档清单，不执行任何恢复操作.
+
+    让用户在恢复前先看清归档里带了哪些执行信息、恢复后可能碰到什么冲突，
+    再决定怎么继续。
+
+    Args:
+        manifest_path: 归档清单文件路径
+        db_path: 数据库路径（用于冲突检测），None 时只预览内容不检测冲突
+        config: 全局配置（用于冲突检测），None 时只预览内容不检测冲突
+
+    Returns:
+        {"success", "manifest", "preview", "conflicts", "suggestion"}
+        - preview: 归档内容的人类可读摘要
+        - conflicts: 检测到的冲突列表（仅当 db_path 和 config 都提供时）
+        - suggestion: 建议的下一步操作
+    """
+    load_result = load_manifest(manifest_path)
+    if not load_result.get("success"):
+        return {"success": False, "error": load_result.get("error")}
+
+    manifest = load_result["manifest"]
+    meta = manifest.get("execution_meta", {})
+    snap = manifest.get("template_snapshot", {})
+    steps = manifest.get("steps", [])
+    export_files = manifest.get("export_files", [])
+    op_logs = manifest.get("operation_logs", [])
+    filters = snap.get("filters", {})
+
+    steps_summary = []
+    for s in steps:
+        step = s.get("step", {})
+        action = step.get("action", "?")
+        detail = step.get("type") or (",".join(step.get("action_types", [])) if step.get("action_types") else "")
+        status = s.get("status", "pending")
+        result = s.get("result", {})
+        extra = ""
+        if result.get("file_path"):
+            extra = f" -> {os.path.basename(result['file_path'])}"
+        elif result.get("count") is not None:
+            extra = f" ({result['count']} 条)"
+        steps_summary.append({
+            "index": s.get("step_index"),
+            "action": action,
+            "detail": detail,
+            "status": status,
+            "extra": extra,
+            "error": s.get("error"),
+        })
+
+    export_files_summary = []
+    for ef in export_files:
+        export_files_summary.append({
+            "step_index": ef.get("step_index"),
+            "type": ef.get("export_type"),
+            "filename": ef.get("filename"),
+            "file_path": ef.get("file_path"),
+            "file_exists": ef.get("file_exists"),
+            "file_size": ef.get("file_size"),
+            "count": ef.get("count"),
+        })
+
+    preview = {
+        "manifest_file": os.path.abspath(manifest_path),
+        "manifest_version": manifest.get("$manifest_version"),
+        "exported_at": manifest.get("exported_at"),
+        "execution": {
+            "id": meta.get("execution_id"),
+            "status": meta.get("status"),
+            "started_at": meta.get("started_at"),
+            "finished_at": meta.get("finished_at"),
+            "steps_total": meta.get("steps_total"),
+            "steps_done": meta.get("steps_done"),
+            "steps_failed": meta.get("steps_failed"),
+        },
+        "template": {
+            "id": snap.get("id") or meta.get("template_id"),
+            "name": snap.get("name") or meta.get("template_name"),
+            "version": snap.get("version") or meta.get("template_version"),
+            "description": snap.get("description"),
+            "content_hash": (snap.get("content_hash") or "")[:16] + "..." if snap.get("content_hash") else None,
+            "filters": {
+                "status": filters.get("status"),
+                "location": filters.get("location"),
+                "sku": filters.get("sku"),
+            },
+            "export_fields": snap.get("export_fields"),
+            "remark_template": snap.get("remark_template"),
+            "steps_count": len(snap.get("steps", [])),
+        },
+        "operator": manifest.get("operator") or meta.get("operator"),
+        "active_plan": manifest.get("active_plan") or meta.get("active_plan"),
+        "steps": steps_summary,
+        "export_files": export_files_summary,
+        "operation_logs_count": len(op_logs),
+        "config_summary": manifest.get("config_summary", {}),
+    }
+
+    conflicts = []
+    suggestion_parts = []
+
+    if db_path and config:
+        conflicts = detect_restore_conflicts(db_path, config, manifest)
+        if conflicts:
+            blocking = [c for c in conflicts if c["type"] in BLOCKING_CONFLICT_TYPES]
+            if blocking:
+                suggestion_parts.append(
+                    "检测到阻塞冲突。建议："
+                    "1) 使用 --conflict save-as 自动处理冲突；"
+                    "2) 或手动清理冲突后再恢复。"
+                )
+            else:
+                suggestion_parts.append("检测到非阻塞冲突，可正常恢复。")
+        else:
+            suggestion_parts.append("未检测到冲突，可直接恢复。")
+
+        exec_status = meta.get("status", "")
+        if exec_status in ("running", "failed", "interrupted"):
+            suggestion_parts.append(
+                f"原执行状态为「{exec_status}」，恢复后可使用 "
+                f"'template-run {snap.get('name') or meta.get('template_name')} --resume' 续跑。"
+            )
+        suggestion_parts.append(
+            f"恢复命令：template-restore-execution {os.path.basename(manifest_path)} "
+            f"[--conflict abort|save-as]"
+        )
+    else:
+        suggestion_parts.append(
+            "仅预览内容，未检测冲突。如需检测冲突，请在有数据库的环境下运行预览。"
+        )
+        suggestion_parts.append(
+            f"恢复命令：template-restore-execution {os.path.basename(manifest_path)}"
+        )
+
+    suggestion = " ".join(suggestion_parts)
+
+    return {
+        "success": True,
+        "manifest": manifest,
+        "preview": preview,
+        "conflicts": conflicts,
+        "suggestion": suggestion,
+    }
 
 
 def _restore_template_from_snapshot(

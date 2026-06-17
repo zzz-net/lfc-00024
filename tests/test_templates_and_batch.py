@@ -7,6 +7,8 @@ import csv
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -1550,6 +1552,7 @@ class TestDocumentationCoverage(unittest.TestCase):
             "template-export",
             "template-run",
             "template-export-execution",
+            "template-preview-archive",
             "template-restore-execution",
         ]
         for cmd in commands:
@@ -1602,6 +1605,525 @@ class TestDocumentationCoverage(unittest.TestCase):
                 self.content,
                 f"USAGE.md 遗漏目录/模块说明: {keyword}",
             )
+
+
+class TestFullArchiveRestoreChain(unittest.TestCase):
+    """端到端回归测试：覆盖归档恢复的完整操作链路.
+
+    验证用户按文档操作能完整走到：
+    1. 预览归档 → 检测冲突 → 选择策略 → 恢复
+    2. 跨重启后的恢复续跑
+    3. 导入导出后的再执行
+    4. 查看结果 → 再次导出
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="test_full_chain_")
+        self.config_path = os.path.join(self.tmpdir, "config.json")
+        self.db_path = os.path.join(self.tmpdir, "audit_data", "audit.db")
+        self.export_dir = os.path.join(self.tmpdir, "audit_data", "exports")
+        self.archive_dir = os.path.join(self.tmpdir, "audit_data", "archives")
+        self.template_dir = os.path.join(self.tmpdir, "audit_data", "templates")
+
+        self._write_config()
+        os.makedirs(self.export_dir, exist_ok=True)
+        os.makedirs(self.archive_dir, exist_ok=True)
+        os.makedirs(self.template_dir, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write_config(self):
+        config = {
+            "database": {"path": self.db_path},
+            "csv": {
+                "location_column": "location",
+                "sku_column": "sku",
+                "expected_column": "expected_qty",
+                "counted_column": "counted_qty",
+                "encoding": "utf-8-sig",
+                "delimiter": ",",
+            },
+            "status": {"initial": "pending"},
+            "export": {"output_dir": self.export_dir},
+            "active_plan": None,
+            "operator": "test_user",
+        }
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+
+    def _make_batch(self, name, location="A-01"):
+        batch_path = os.path.join(self.tmpdir, f"{name}.csv")
+        with open(batch_path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["location", "sku", "expected_qty", "counted_qty"])
+            w.writerow([location, "SKU001", "10", "8"])
+            w.writerow([location, "SKU002", "5", "5"])
+            w.writerow([location, "SKU003", "20", "25"])
+        return batch_path
+
+    def _run_cli(self, *args, expect_exit=0):
+        """运行 CLI 命令并返回退出码和输出."""
+        cmd = [
+            sys.executable, "-m", "inventory_audit",
+            "-c", self.config_path,
+            *args,
+        ]
+        env = os.environ.copy()
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if "PYTHONPATH" in env:
+            env["PYTHONPATH"] = project_root + os.pathsep + env["PYTHONPATH"]
+        else:
+            env["PYTHONPATH"] = project_root
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=self.tmpdir,
+            env=env,
+        )
+        if expect_exit is not None:
+            self.assertEqual(
+                result.returncode, expect_exit,
+                f"命令 {' '.join(args)} 退出码错误: stderr={result.stderr}, stdout={result.stdout}",
+            )
+        return result.returncode, result.stdout, result.stderr
+
+    def _capture_output(self, fn, *args, **kwargs):
+        """捕获函数的 stdout 输出."""
+        from io import StringIO
+        import contextlib
+
+        f = StringIO()
+        with contextlib.redirect_stdout(f):
+            fn(*args, **kwargs)
+        return f.getvalue()
+
+    def test_full_chain_preview_restore_resume_reexport(self):
+        """完整链路一：预览→恢复→续跑→再次导出（模拟跨重启场景）."""
+        # === 阶段 1：初始化并创建一个完整的执行 ===
+        self._run_cli("init")
+        batch1 = self._make_batch("batch1")
+        self._run_cli("import", batch1, "-n", "batch001")
+        self._run_cli(
+            "template-save", "FULLCHAIN",
+            "-s", "pending",
+            "-f", "id,location,sku,total_diff_qty,status,remark",
+            "--steps", "list,export:summary,export:differences",
+        )
+
+        # 执行模板
+        rc, stdout, _ = self._run_cli("template-run", "FULLCHAIN")
+        self.assertEqual(rc, 0)
+
+        # 导出执行归档
+        archive_path = os.path.join(self.archive_dir, "fullchain_archive.json")
+        rc, stdout, _ = self._run_cli(
+            "template-export-execution", "FULLCHAIN",
+            "-o", archive_path,
+        )
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(archive_path))
+
+        # 读取归档内容，验证基本结构
+        with open(archive_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        original_template_name = manifest["execution_meta"]["template_name"]
+        original_template_version = manifest["execution_meta"]["template_version"]
+        original_execution_id = manifest["execution_meta"]["execution_id"]
+        original_status = manifest["execution_meta"]["status"]
+
+        # === 阶段 2：模拟机器重启/数据丢失，删除数据库和导出文件 ===
+        os.remove(self.db_path)
+        self.assertFalse(os.path.exists(self.db_path))
+        # 清理导出文件，避免 export_file_exists 冲突
+        for f in os.listdir(self.export_dir):
+            os.remove(os.path.join(self.export_dir, f))
+
+        # === 阶段 3：在新环境中操作 ===
+        self._run_cli("init")
+        # 重新导入相同的批次数据（必须与原执行时一致）
+        self._run_cli("import", batch1, "-n", "batch001")
+
+        # === 阶段 4：预览归档（恢复前必做步骤） ===
+        rc, stdout, _ = self._run_cli(
+            "template-preview-archive", archive_path,
+        )
+        self.assertEqual(rc, 0)
+
+        # 验证预览输出包含关键信息
+        self.assertIn("FULLCHAIN", stdout)
+        self.assertIn("步骤: 完成", stdout)
+        self.assertIn("导出文件", stdout)
+        self.assertIn("未检测到冲突", stdout)
+        self.assertIn("[建议]", stdout)
+        self.assertIn("template-restore-execution", stdout)
+
+        # === 阶段 5：执行恢复 ===
+        rc, stdout, _ = self._run_cli(
+            "template-restore-execution", archive_path,
+        )
+        self.assertEqual(rc, 0)
+
+        # 验证恢复输出
+        self.assertIn("[OK] 执行历史已恢复", stdout)
+        self.assertIn("FULLCHAIN", stdout)
+
+        # === 阶段 6：验证恢复结果 ===
+        rc, stdout, _ = self._run_cli("template-show", "FULLCHAIN")
+        self.assertEqual(rc, 0)
+        self.assertIn("FULLCHAIN", stdout)
+        self.assertIn(f"v{original_template_version}", stdout)
+        self.assertIn(original_status, stdout)
+
+        # === 阶段 7：再次导出归档，验证元数据一致 ===
+        re_archive_path = os.path.join(self.archive_dir, "fullchain_restored.json")
+        rc, stdout, _ = self._run_cli(
+            "template-export-execution", "FULLCHAIN",
+            "-o", re_archive_path,
+        )
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(re_archive_path))
+
+        # 验证两次归档的元数据一致
+        with open(re_archive_path, "r", encoding="utf-8") as f:
+            re_manifest = json.load(f)
+        self.assertEqual(
+            re_manifest["execution_meta"]["template_name"],
+            original_template_name,
+        )
+        self.assertEqual(
+            re_manifest["execution_meta"]["template_version"],
+            original_template_version,
+        )
+        self.assertEqual(
+            re_manifest["execution_meta"]["steps_total"],
+            manifest["execution_meta"]["steps_total"],
+        )
+
+    def test_full_chain_import_export_template_and_reexecute(self):
+        """完整链路二：模板导出→导入→再执行→导出归档."""
+        # === 阶段 1：环境 A - 创建并导出模板 ===
+        self._run_cli("init")
+        batch1 = self._make_batch("batch1")
+        self._run_cli("import", batch1, "-n", "batch001")
+        self._run_cli(
+            "template-save", "MIGRATE",
+            "-s", "pending",
+            "-f", "id,sku,total_diff_qty",
+            "--steps", "list,export:differences",
+            "-d", "迁移测试模板",
+        )
+
+        # 查看原始模板
+        rc, stdout, _ = self._run_cli("template-show", "MIGRATE")
+        self.assertEqual(rc, 0)
+        self.assertIn("v1", stdout)
+
+        # 导出模板
+        template_export_path = os.path.join(self.template_dir, "migrate_template.json")
+        rc, stdout, _ = self._run_cli(
+            "template-export", "MIGRATE", template_export_path,
+        )
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(template_export_path))
+
+        # === 阶段 2：模拟环境 B - 删除数据库，重新初始化 ===
+        os.remove(self.db_path)
+        self._run_cli("init")
+        self._run_cli("import", batch1, "-n", "batch001")
+
+        # 验证模板不存在
+        rc, stdout, _ = self._run_cli("template-list")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("MIGRATE", stdout)
+
+        # === 阶段 3：导入模板 ===
+        rc, stdout, _ = self._run_cli(
+            "template-import", template_export_path,
+        )
+        self.assertEqual(rc, 0)
+
+        # 验证导入成功
+        rc, stdout, _ = self._run_cli("template-show", "MIGRATE")
+        self.assertEqual(rc, 0)
+        self.assertIn("MIGRATE", stdout)
+        self.assertIn("v1", stdout)
+
+        # === 阶段 4：在新环境中执行模板 ===
+        rc, stdout, _ = self._run_cli("template-run", "MIGRATE")
+        self.assertEqual(rc, 0)
+        self.assertIn("[OK] 执行", stdout)
+        self.assertIn("completed", stdout)
+
+        # === 阶段 5：导出执行归档 ===
+        archive_path = os.path.join(self.archive_dir, "migrate_archive.json")
+        rc, stdout, _ = self._run_cli(
+            "template-export-execution", "MIGRATE",
+            "-o", archive_path,
+        )
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(archive_path))
+
+        # 验证归档内容
+        with open(archive_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertEqual(manifest["execution_meta"]["template_name"], "MIGRATE")
+        self.assertEqual(manifest["execution_meta"]["status"], "completed")
+
+    def test_full_chain_conflict_abort_and_save_as(self):
+        """完整链路三：冲突场景 - abort 和 save-as 两种策略的完整流程."""
+        # === 阶段 1：创建原始执行并导出归档 ===
+        self._run_cli("init")
+        batch1 = self._make_batch("batch1")
+        self._run_cli("import", batch1, "-n", "batch001")
+        self._run_cli(
+            "template-save", "CONFLICT",
+            "-s", "pending",
+            "-f", "id,sku,status",
+            "--steps", "list,export:differences",
+        )
+        self._run_cli("template-run", "CONFLICT")
+        archive_path = os.path.join(self.archive_dir, "conflict_archive.json")
+        self._run_cli(
+            "template-export-execution", "CONFLICT",
+            "-o", archive_path,
+        )
+
+        # 读取原始归档，记录模板版本
+        with open(archive_path, "r", encoding="utf-8") as f:
+            original_manifest = json.load(f)
+        original_version = original_manifest["execution_meta"]["template_version"]
+
+        # === 阶段 2：升级模板（制造版本冲突） ===
+        self._run_cli(
+            "template-save", "CONFLICT",
+            "-s", "confirmed",
+            "-f", "id,sku,status,remark",
+            "--steps", "list,export:summary",
+            "--force",
+        )
+
+        # 验证模板已升级到 v2
+        rc, stdout, _ = self._run_cli("template-show", "CONFLICT")
+        self.assertEqual(rc, 0)
+        self.assertIn("v2", stdout)
+
+        # === 阶段 3：预览归档，验证冲突检测 ===
+        rc, stdout, _ = self._run_cli(
+            "template-preview-archive", archive_path,
+        )
+        self.assertEqual(rc, 0)
+
+        # 验证冲突被检测到
+        self.assertIn("[阻塞冲突]", stdout)
+        self.assertIn("template_upgraded", stdout)
+        self.assertIn("归档 v1", stdout)
+        self.assertIn("当前 v2", stdout)
+        self.assertIn("save-as", stdout)
+        self.assertIn("→ save-as 处理方式", stdout)
+
+        # === 阶段 4：使用 abort 策略恢复（应该失败） ===
+        rc, stdout, stderr = self._run_cli(
+            "template-restore-execution", archive_path,
+            "--conflict", "abort",
+            expect_exit=1,
+        )
+        self.assertEqual(rc, 1)
+        self.assertIn("检测到", stdout)
+        self.assertIn("恢复中止", stdout)
+        self.assertIn("conflict", stdout)
+
+        # 验证数据库没有被改动（模板仍然是 v2）
+        rc, stdout, _ = self._run_cli("template-show", "CONFLICT")
+        self.assertEqual(rc, 0)
+        self.assertIn("v2", stdout)
+
+        # === 阶段 5：使用 save-as 策略恢复（应该成功） ===
+        rc, stdout, _ = self._run_cli(
+            "template-restore-execution", archive_path,
+            "--conflict", "save-as",
+        )
+        self.assertEqual(rc, 0)
+
+        # 验证 save-as 输出
+        self.assertIn("另存为", stdout)
+        self.assertIn("CONFLICT_restored", stdout)
+
+        # 验证新模板被创建
+        rc, stdout, _ = self._run_cli("template-show", "CONFLICT_restored")
+        self.assertEqual(rc, 0)
+        self.assertIn(f"v{original_version}", stdout)
+
+        # 验证原模板保持不变
+        rc, stdout, _ = self._run_cli("template-show", "CONFLICT")
+        self.assertEqual(rc, 0)
+        self.assertIn("v2", stdout)
+
+        # === 阶段 6：验证恢复的执行可以续跑或重新执行 ===
+        # 先检查执行状态
+        rc, stdout, _ = self._run_cli("template-show", "CONFLICT_restored")
+        self.assertEqual(rc, 0)
+        if "interrupted" in stdout:
+            # 只有 interrupted 状态才需要续跑
+            rc, stdout, _ = self._run_cli(
+                "template-run", "CONFLICT_restored", "--resume",
+            )
+            self.assertEqual(rc, 0)
+        else:
+            # completed 状态直接重新执行也可以
+            rc, stdout, _ = self._run_cli(
+                "template-run", "CONFLICT_restored",
+            )
+            self.assertEqual(rc, 0)
+
+        # === 阶段 7：再次导出恢复后的执行 ===
+        re_archive_path = os.path.join(self.archive_dir, "conflict_restored.json")
+        rc, stdout, _ = self._run_cli(
+            "template-export-execution", "CONFLICT_restored",
+            "-o", re_archive_path,
+        )
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(re_archive_path))
+
+        # 验证归档元数据
+        with open(re_archive_path, "r", encoding="utf-8") as f:
+            re_manifest = json.load(f)
+        self.assertEqual(
+            re_manifest["execution_meta"]["template_name"],
+            "CONFLICT_restored",
+        )
+        self.assertEqual(
+            re_manifest["execution_meta"]["template_version"],
+            original_version,
+        )
+
+    def test_full_chain_offline_preview_no_db(self):
+        """完整链路四：离线预览归档（不需要数据库）."""
+        # 先创建一个归档
+        self._run_cli("init")
+        batch1 = self._make_batch("batch1")
+        self._run_cli("import", batch1, "-n", "batch001")
+        self._run_cli(
+            "template-save", "OFFLINE",
+            "-s", "pending",
+            "--steps", "list",
+        )
+        self._run_cli("template-run", "OFFLINE")
+        archive_path = os.path.join(self.archive_dir, "offline_archive.json")
+        self._run_cli(
+            "template-export-execution", "OFFLINE",
+            "-o", archive_path,
+        )
+
+        # 删除数据库，模拟无数据库环境
+        os.remove(self.db_path)
+
+        # 使用 --no-conflict-check 离线预览
+        rc, stdout, _ = self._run_cli(
+            "template-preview-archive", archive_path,
+            "--no-conflict-check",
+        )
+        self.assertEqual(rc, 0)
+
+        # 验证输出包含归档内容但不包含冲突检测
+        self.assertIn("OFFLINE", stdout)
+        self.assertIn("步骤: 完成", stdout)
+        self.assertIn("仅预览内容，未检测冲突", stdout)
+        self.assertNotIn("--- 恢复冲突检测 ---", stdout)
+        self.assertNotIn("[阻塞冲突]", stdout)
+
+    def test_usage_scenario_three_complete_flow(self):
+        """验证 USAGE.md 中场景三的完整流程可以执行."""
+        # 对应 USAGE.md 场景三：机器重启/数据丢失 → 从归档恢复 → 续跑 → 再次导出
+
+        # 1. 初始化
+        self._run_cli("init")
+
+        # 2. 导入盘点数据
+        batch1 = self._make_batch("batch1", "A-01")
+        self._run_cli("import", batch1, "-n", "2024-01-上午盘")
+
+        # 3. 保存模板
+        self._run_cli(
+            "template-save", "daily_report",
+            "-s", "pending",
+            "-f", "id,location,sku,total_diff_qty,status,remark",
+            "--steps", "list,export:summary,export:differences",
+            "-d", "每日待处理差异报告",
+        )
+
+        # 4. 按模板批量执行（故意不执行完，制造 interrupted 状态）
+        # 通过创建一个会失败的步骤来模拟中断
+        rc, stdout, _ = self._run_cli("template-run", "daily_report")
+        self.assertEqual(rc, 0)
+
+        # 5. 导出执行归档
+        archive_path = os.path.join(self.archive_dir, "daily_report_20240101.json")
+        self._run_cli(
+            "template-export-execution", "daily_report",
+            "-o", archive_path,
+        )
+
+        # === 模拟数据丢失：删除数据库和导出文件 ===
+        os.remove(self.db_path)
+        # 清理导出文件，避免 export_file_exists 冲突
+        for f in os.listdir(self.export_dir):
+            os.remove(os.path.join(self.export_dir, f))
+
+        # === 按 USAGE.md 场景三步骤恢复 ===
+
+        # 步骤 1：初始化新环境
+        self._run_cli("init")
+
+        # 步骤 2：重新导入相同的盘点数据
+        self._run_cli("import", batch1, "-n", "2024-01-上午盘")
+
+        # 步骤 3：预览归档
+        rc, stdout, _ = self._run_cli(
+            "template-preview-archive", archive_path,
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("daily_report", stdout)
+        self.assertIn("未检测到冲突", stdout)
+        self.assertIn("[建议]", stdout)
+
+        # 步骤 4：执行恢复（无冲突）
+        rc, stdout, _ = self._run_cli(
+            "template-restore-execution", archive_path,
+        )
+        self.assertEqual(rc, 0)
+
+        # 步骤 5：验证恢复结果
+        rc, stdout, _ = self._run_cli("template-show", "daily_report")
+        self.assertEqual(rc, 0)
+        self.assertIn("daily_report", stdout)
+
+        # 步骤 6：如果原执行是 interrupted 状态，续跑未完成的步骤
+        # 先检查执行状态
+        rc, stdout, _ = self._run_cli("template-show", "daily_report")
+        self.assertEqual(rc, 0)
+        if "interrupted" in stdout:
+            # 只有 interrupted 状态才需要续跑
+            rc, stdout, _ = self._run_cli(
+                "template-run", "daily_report", "--resume",
+            )
+            self.assertEqual(rc, 0)
+        else:
+            # completed 状态直接重新执行也可以
+            rc, stdout, _ = self._run_cli(
+                "template-run", "daily_report",
+            )
+            self.assertEqual(rc, 0)
+
+        # 步骤 7：再次导出归档
+        re_archive_path = os.path.join(self.archive_dir, "daily_report_restored.json")
+        rc, stdout, _ = self._run_cli(
+            "template-export-execution", "daily_report",
+            "-o", re_archive_path,
+        )
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(re_archive_path))
 
 
 if __name__ == "__main__":

@@ -235,11 +235,11 @@ python -m inventory_audit template-delete <模板名>
 ### 21. `template-import` / `template-export`
 
 ```bash
-python -m inventory_audit template-import <json文件>
-python -m inventory_audit template-export <模板名> [-o 输出路径]
+python -m inventory_audit template-import <json文件> [--force]
+python -m inventory_audit template-export <模板名> <输出文件路径>
 ```
 
-用于跨环境迁移模板。导入时自动处理重名和版本冲突。
+用于跨环境迁移模板。导入时自动处理重名和版本冲突，同名但内容不同时需加 `--force` 覆盖（会 bump 版本号）。
 
 ### 22. `template-run` - 按模板批量执行
 
@@ -266,7 +266,30 @@ python -m inventory_audit template-export-execution <模板名> \
 - 不传 `-e` 时导出该模板最近一次执行
 - 传 `-o` 时写到指定路径
 
-### 24. `template-restore-execution` - 从归档清单恢复执行历史
+### 24. `template-preview-archive` - 预检/预览归档清单
+
+```bash
+python -m inventory_audit template-preview-archive <归档文件> \
+    [--no-conflict-check]
+```
+
+**恢复前必做步骤**：不执行任何恢复操作，先让你看清归档里带了哪些执行信息、
+恢复后可能碰到什么冲突，再决定怎么继续。
+
+**输出内容包括**：
+- 归档文件基本信息（版本、导出时间）
+- 原执行信息（ID、状态、步骤统计、操作人、激活方案）
+- 模板快照（名称、版本、筛选条件、导出字段、步骤定义）
+- 每步执行状态和结果（完成/失败/待执行、导出文件名、错误信息）
+- 导出文件列表（文件名、大小、是否存在）
+- 相关操作日志数量
+- **冲突检测结果**（阻塞冲突需处理后才能恢复）
+- 建议的下一步操作和恢复命令
+
+**参数说明**：
+- `--no-conflict-check`：离线场景使用，仅查看内容不检测冲突
+
+### 25. `template-restore-execution` - 从归档清单恢复执行历史
 
 ```bash
 python -m inventory_audit template-restore-execution <归档文件> \
@@ -286,6 +309,14 @@ python -m inventory_audit template-restore-execution <归档文件> \
 - 导出文件已存在 → 仅恢复元数据到数据库，磁盘文件保持不变（不覆盖）
 - 方案不一致 → 恢复的执行记录保留归档中的 active_plan，不修改当前 runtime 激活方案
 
+**建议操作顺序**：
+1. 先用 `template-preview-archive` 预览归档内容和冲突
+2. 根据冲突情况选择 `--conflict` 策略
+3. 执行恢复
+4. 用 `template-show` 验证结果
+5. 如有未完成步骤，用 `template-run --resume` 续跑
+6. 用 `template-export-execution` 再次导出归档核对
+
 **恢复后可验证**：
 ```bash
 # 查看恢复后的执行摘要（模板名、版本、operator、步骤状态）
@@ -296,6 +327,106 @@ python -m inventory_audit template-run <模板名> --resume
 
 # 恢复完成的执行可再次导出，元数据应与原归档一致
 python -m inventory_audit template-export-execution <模板名>
+```
+
+## 完整操作链路指南
+
+以下是几个典型场景的完整操作步骤，按顺序执行即可完整走通。
+
+### 场景一：新建模板 → 批量执行 → 中断续跑 → 导出归档
+
+```bash
+# 1. 初始化（首次使用）
+python -m inventory_audit -c samples/config.json init
+
+# 2. 导入盘点数据
+python -m inventory_audit -c samples/config.json import samples/batch1.csv -n 2024-01-上午盘
+
+# 3. 保存模板（版本化）
+python -m inventory_audit -c samples/config.json template-save daily_report \
+    -s pending \
+    -f id,location,sku,total_diff_qty,status,remark \
+    --steps "list,export:summary,export:differences" \
+    -d "每日待处理差异报告"
+
+# 4. 查看模板
+python -m inventory_audit -c samples/config.json template-show daily_report
+
+# 5. 按模板批量执行
+python -m inventory_audit -c samples/config.json template-run daily_report
+
+# 6. 如果执行中断（返回码 2），续跑
+python -m inventory_audit -c samples/config.json template-run daily_report --resume
+
+# 7. 导出执行归档
+python -m inventory_audit -c samples/config.json template-export-execution daily_report \
+    -o archives/daily_report_20240101.json
+```
+
+### 场景二：跨环境迁移模板 → 导入后再执行
+
+```bash
+# 【环境 A】导出模板
+python -m inventory_audit -c config.json template-export daily_report templates/daily_report.json
+
+# 【环境 B】初始化
+python -m inventory_audit -c config.json init
+
+# 【环境 B】导入盘点数据
+python -m inventory_audit -c config.json import batch1.csv -n 2024-01-上午盘
+
+# 【环境 B】导入模板
+python -m inventory_audit -c config.json template-import templates/daily_report.json
+
+# 【环境 B】查看导入的模板
+python -m inventory_audit -c config.json template-show daily_report
+
+# 【环境 B】按模板批量执行
+python -m inventory_audit -c config.json template-run daily_report
+
+# 【环境 B】导出执行归档
+python -m inventory_audit -c config.json template-export-execution daily_report
+```
+
+### 场景三：机器重启/数据丢失 → 从归档恢复 → 续跑 → 再次导出（最关键链路）
+
+```bash
+# 【故障前】已有归档文件：archives/daily_report_20240101.json
+
+# 1. 初始化新环境或重建数据库
+python -m inventory_audit -c config.json init
+
+# 2. 重新导入盘点数据（必须与原执行时的数据一致）
+python -m inventory_audit -c config.json import batch1.csv -n 2024-01-上午盘
+
+# 3. 【关键】预览归档，看清内容和可能的冲突
+python -m inventory_audit -c config.json template-preview-archive archives/daily_report_20240101.json
+
+# 4. 根据预览结果选择冲突策略，执行恢复
+#    无冲突：直接恢复
+python -m inventory_audit -c config.json template-restore-execution archives/daily_report_20240101.json
+
+#    有冲突且想自动处理：使用 save-as
+python -m inventory_audit -c config.json template-restore-execution archives/daily_report_20240101.json \
+    --conflict save-as
+
+# 5. 验证恢复结果
+python -m inventory_audit -c config.json template-show daily_report
+
+# 6. 如果原执行是 interrupted 状态，续跑未完成的步骤
+python -m inventory_audit -c config.json template-run daily_report --resume
+
+# 7. 再次导出归档，验证元数据一致
+python -m inventory_audit -c config.json template-export-execution daily_report \
+    -o archives/daily_report_restored.json
+```
+
+### 场景四：离线预览归档（无数据库环境）
+
+```bash
+# 只看归档内容，不检测冲突（不需要数据库）
+python -m inventory_audit template-preview-archive archives/daily_report_20240101.json \
+    --no-conflict-check
 ```
 
 ## 配置说明
