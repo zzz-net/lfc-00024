@@ -944,6 +944,49 @@ def log_export_operation(
         conn.commit()
 
 
+def restore_operation_log(
+    db_path: str,
+    plan_id: Optional[int],
+    plan_name: Optional[str],
+    operator: Optional[str],
+    action_type: str,
+    target_diff_id: Optional[int],
+    action_data: Dict[str, Any],
+    snapshot_before: Optional[str] = None,
+    created_at: Optional[str] = None,
+) -> int:
+    """低层次恢复一条 operation_log（用于归档恢复）.
+
+    与 log_* 不同，不做业务约束校验，直接按提供的字段落库。
+    plan_id/target_diff_id 在新库中可能不存在，调用方负责置为 None 避免外键问题。
+    支持指定 created_at 以还原时间顺序。
+
+    Returns: 新插入的 log id
+    """
+    action_json = json.dumps(action_data, ensure_ascii=False)
+    with get_conn(db_path) as conn:
+        if created_at:
+            cursor = conn.execute(
+                """INSERT INTO operation_logs
+                   (plan_id, plan_name, operator, action_type, target_diff_id,
+                    action_data, snapshot_before, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (plan_id, plan_name, operator, action_type, target_diff_id,
+                 action_json, snapshot_before, created_at),
+            )
+        else:
+            cursor = conn.execute(
+                """INSERT INTO operation_logs
+                   (plan_id, plan_name, operator, action_type, target_diff_id,
+                    action_data, snapshot_before)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (plan_id, plan_name, operator, action_type, target_diff_id,
+                 action_json, snapshot_before),
+            )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
 def get_operation_logs(
     db_path: str,
     plan_id: Optional[int] = None,

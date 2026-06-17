@@ -72,7 +72,7 @@ def _collect_export_files(
 def _collect_operation_logs(
     db_path: str, template_name: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """收集相关导出操作日志（按模板名过滤）."""
+    """收集相关导出操作日志（按模板名过滤），保留完整恢复所需字段."""
     logs = db.get_operation_logs(db_path, action_type="export")
     result = []
     for log in logs:
@@ -81,13 +81,13 @@ def _collect_operation_logs(
             continue
         result.append({
             "log_id": log["id"],
+            "plan_id": log.get("plan_id"),
+            "plan_name": log.get("plan_name"),
             "operator": log.get("operator"),
-            "export_type": action_data.get("export_type"),
-            "file_path": action_data.get("file_path"),
-            "template_id": action_data.get("template_id"),
-            "template_name": action_data.get("template_name"),
-            "template_version": action_data.get("template_version"),
-            "count": action_data.get("count"),
+            "action_type": log.get("action_type"),
+            "target_diff_id": log.get("target_diff_id"),
+            "action_data": action_data,
+            "snapshot_before": log.get("snapshot_before"),
             "created_at": log.get("created_at"),
         })
     return result
@@ -225,9 +225,9 @@ def detect_restore_conflicts(
 ) -> List[Dict[str, Any]]:
     """检测恢复冲突.
 
-    冲突类型：
+    冲突类型（全部为阻塞级，需显式 save-as 才能继续）：
     - template_upgraded: 同名模板已存在且版本/内容不一致
-    - export_file_exists: 归档中的导出文件已存在于磁盘
+    - export_file_exists: 归档中的导出文件已存在于磁盘（会被误覆盖/混淆）
     - active_plan_mismatch: 当前激活方案与归档记录不一致
     """
     conflicts: List[Dict[str, Any]] = []
@@ -243,7 +243,7 @@ def detect_restore_conflicts(
         if snap_hash != cur_hash or snap_version != cur_version:
             conflicts.append({
                 "type": "template_upgraded",
-                "severity": "warning",
+                "severity": "error",
                 "message": (
                     f"同名模板 {tpl_name} 已升级："
                     f"归档 v{snap_version}（hash {snap_hash[:12] if snap_hash else '?'}）vs "
@@ -259,7 +259,7 @@ def detect_restore_conflicts(
         if fp and os.path.exists(fp):
             conflicts.append({
                 "type": "export_file_exists",
-                "severity": "warning",
+                "severity": "error",
                 "message": f"导出文件已存在：{fp}",
                 "file_path": fp,
                 "filename": ef.get("filename"),
@@ -270,7 +270,7 @@ def detect_restore_conflicts(
     if archived_plan != current_plan:
         conflicts.append({
             "type": "active_plan_mismatch",
-            "severity": "info",
+            "severity": "error",
             "message": (
                 f"激活方案不一致：归档记录 {archived_plan or '(无)'} vs "
                 f"当前 {current_plan or '(无)'}"
@@ -280,6 +280,19 @@ def detect_restore_conflicts(
         })
 
     return conflicts
+
+
+BLOCKING_CONFLICT_TYPES = frozenset({
+    "template_upgraded",
+    "export_file_exists",
+    "active_plan_mismatch",
+})
+
+SAVEAS_RESOLVABLE_TYPES = frozenset({
+    "template_upgraded",
+    "export_file_exists",
+    "active_plan_mismatch",
+})
 
 
 def _restore_template_from_snapshot(
@@ -370,6 +383,11 @@ def restore_execution_from_manifest(
         config: 全局配置
         manifest_path: 归档清单路径
         conflict_resolution: "abort" | "save-as"
+            - abort: 检测到任意冲突（模板升级/文件已存在/方案不一致）立即中止
+            - save-as:
+                * 模板冲突时另存为新模板名（<name>_restored[1|2|…]）
+                * 导出文件存在时仅恢复元数据不重写磁盘
+                * 方案不一致时按归档记录的方案恢复（不改动当前激活方案）
 
     Returns:
         {"success", "execution_id", "template", "conflicts", ...}
@@ -383,15 +401,17 @@ def restore_execution_from_manifest(
     manifest = load_result["manifest"]
     conflicts = detect_restore_conflicts(db_path, config, manifest)
 
-    has_blocking = conflict_resolution == "abort" and any(
-        c["type"] == "template_upgraded"
-        for c in conflicts
-    )
-    if has_blocking:
+    blocking_conflicts = [c for c in conflicts if c["type"] in BLOCKING_CONFLICT_TYPES]
+    if blocking_conflicts and conflict_resolution == "abort":
         return {
             "success": False, "conflict": True, "conflicts": conflicts,
-            "error": "检测到阻塞冲突，恢复中止。使用 --conflict save-as 忽略非致命冲突",
+            "error": (
+                "检测到阻塞冲突，恢复中止。"
+                "使用 --conflict save-as 处理：模板另存/保留现有文件/按归档方案恢复"
+            ),
         }
+    if blocking_conflicts and conflict_resolution not in ("abort", "save-as"):
+        return {"success": False, "error": f"未知冲突处理策略：{conflict_resolution}"}
 
     snap = manifest["template_snapshot"]
     tpl_restore = _restore_template_from_snapshot(
@@ -441,6 +461,24 @@ def restore_execution_from_manifest(
         finished=meta.get("status") in ("completed", "failed"),
     )
 
+    logs_restored = 0
+    for op_log in manifest.get("operation_logs", []):
+        try:
+            db.restore_operation_log(
+                db_path,
+                plan_id=None,
+                plan_name=op_log.get("plan_name"),
+                operator=op_log.get("operator"),
+                action_type=op_log.get("action_type") or "export",
+                target_diff_id=None,
+                action_data=op_log.get("action_data") or {},
+                snapshot_before=op_log.get("snapshot_before"),
+                created_at=op_log.get("created_at"),
+            )
+            logs_restored += 1
+        except Exception:
+            pass
+
     return {
         "success": True,
         "execution_id": new_exec_id,
@@ -451,4 +489,5 @@ def restore_execution_from_manifest(
         "template_action": tpl_restore.get("action"),
         "conflicts": conflicts,
         "steps_restored": len(manifest.get("steps", [])),
+        "logs_restored": logs_restored,
     }

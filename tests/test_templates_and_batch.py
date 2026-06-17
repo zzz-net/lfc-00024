@@ -908,17 +908,29 @@ class TestExecutionArchiveRestore(_BaseTest):
         self.assertIsNotNone(manifest_path)
         return result, manifest_path
 
-    def test_restore_to_fresh_db(self):
-        """删除 DB 后，从归档清单恢复模板和执行记录."""
-        run_result, manifest_path = self._setup_and_archive()
-        eid_orig = run_result["execution_id"]
-
-        templates_dir = os.path.join(os.path.dirname(self.db_path), "templates")
+    def _wipe_state(self, keep_exports=False):
+        """彻底清空本地状态（DB/templates/可选 exports），模拟机器重启+数据丢失."""
+        data_dir = os.path.dirname(self.db_path)
+        templates_dir = os.path.join(data_dir, "templates")
+        exports_dir = self.output_dir
         os.remove(self.db_path)
         if os.path.isdir(templates_dir):
             shutil.rmtree(templates_dir)
+        if not keep_exports and os.path.isdir(exports_dir):
+            for fn in os.listdir(exports_dir):
+                fp = os.path.join(exports_dir, fn)
+                try:
+                    if os.path.isfile(fp):
+                        os.remove(fp)
+                except OSError:
+                    pass
         db.init_db(self.db_path)
 
+    def test_restore_to_fresh_db(self):
+        """删除 DB/templates/exports 后，从归档清单恢复模板和执行记录（纯净环境 abort 应成功）."""
+        run_result, manifest_path = self._setup_and_archive()
+
+        self._wipe_state(keep_exports=False)
         self.assertIsNone(db.get_template(self.db_path, "ARC_RES"))
         self.assertEqual(db.list_executions(self.db_path), [])
 
@@ -950,12 +962,12 @@ class TestExecutionArchiveRestore(_BaseTest):
     def test_template_show_after_restore(self):
         """恢复后 template-show 能看到模板和执行记录."""
         _, manifest_path = self._setup_and_archive("SHOW_RES")
-        os.remove(self.db_path)
-        db.init_db(self.db_path)
+        self._wipe_state(keep_exports=False)
 
-        archive_mod.restore_execution_from_manifest(
+        r = archive_mod.restore_execution_from_manifest(
             self.db_path, self.config, manifest_path,
         )
+        self.assertTrue(r["success"])
 
         rc = self._run_cli("template-show", "SHOW_RES")
         self.assertEqual(rc, 0)
@@ -981,14 +993,22 @@ class TestExecutionArchiveRestore(_BaseTest):
         self.assertEqual(r1["steps_failed"], 1)
         manifest_path = r1["archive_path"]
 
-        os.remove(self.db_path)
-        db.init_db(self.db_path)
-        self.assertFalse(os.path.exists(self.db_path.replace(".db", "_notexist.db")))
+        self._wipe_state(keep_exports=True)
 
-        restore_result = archive_mod.restore_execution_from_manifest(
-            self.db_path, self.config, manifest_path,
+        # exports 保留 => export_file_exists 冲突 => abort 失败
+        r_fail = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path, conflict_resolution="abort",
         )
-        self.assertTrue(restore_result["success"])
+        self.assertFalse(r_fail["success"])
+        self.assertTrue(r_fail.get("conflict"))
+        types = [c["type"] for c in r_fail["conflicts"]]
+        self.assertIn("export_file_exists", types)
+
+        # save-as 应成功（模板没升级所以不改名，但恢复了执行历史）
+        restore_result = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path, conflict_resolution="save-as",
+        )
+        self.assertTrue(restore_result["success"], f"save-as 失败: {restore_result.get('error')}")
 
         self._import(self._make_batch("after_restore"))
 
@@ -1003,7 +1023,7 @@ class TestExecutionArchiveRestore(_BaseTest):
         self.assertEqual(execs[0]["steps_failed"], 0)
 
     def test_restore_metadata_alignment(self):
-        """恢复后导出的 summary/differences 文件命名、模板版本、日志与原执行一致."""
+        """恢复后再次导出，文件命名、模板版本、操作日志与原执行一致."""
         self._import(self._make_batch("meta"))
         self._save_template(
             "META_RES",
@@ -1027,8 +1047,7 @@ class TestExecutionArchiveRestore(_BaseTest):
         orig_files = set(os.listdir(self.output_dir))
         orig_export_logs = db.get_operation_logs(self.db_path, action_type="export")
 
-        os.remove(self.db_path)
-        db.init_db(self.db_path)
+        self._wipe_state(keep_exports=False)
 
         restore_result = archive_mod.restore_execution_from_manifest(
             self.db_path, self.config, manifest_path,
@@ -1175,6 +1194,135 @@ class TestArchiveConflictResolution(_BaseTest):
         self.assertFalse(result["success"])
         self.assertTrue(result.get("conflict"))
         self.assertIsNotNone(result.get("conflicts"))
+        types = [c["type"] for c in result["conflicts"]]
+        self.assertIn("template_upgraded", types)
+        # 模板已升级 + 导出文件还在，应该同时看到 export_file_exists
+        self.assertIn("export_file_exists", types)
+
+    def test_abort_on_export_file_exists_alone(self):
+        """只有导出文件存在（模板未变、方案一致），abort 也应阻塞."""
+        self._import(self._make_batch())
+        self._save_template("EXP_ONLY", steps=[{"action": "export", "type": "summary"}])
+        template = templates_mod.get_template(self.db_path, self.config, "EXP_ONLY")
+        allowed = cfg.get_allowed_statuses(self.config)
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        manifest_path = r1["archive_path"]
+        tpl_ver_before = template["version"]
+
+        # 只删 DB 和 templates，保留 exports => 仅 export_file_exists 冲突
+        data_dir = os.path.dirname(self.db_path)
+        templates_dir = os.path.join(data_dir, "templates")
+        os.remove(self.db_path)
+        if os.path.isdir(templates_dir):
+            shutil.rmtree(templates_dir)
+        db.init_db(self.db_path)
+
+        result = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path, conflict_resolution="abort",
+        )
+        self.assertFalse(result["success"])
+        self.assertTrue(result.get("conflict"))
+        types = [c["type"] for c in result["conflicts"]]
+        self.assertIn("export_file_exists", types)
+        # 不应有其他冲突类型
+        self.assertNotIn("template_upgraded", types)
+        self.assertNotIn("active_plan_mismatch", types)
+
+        # save-as 可以继续，并且执行历史、导出记录、步骤状态恢复正确
+        ok = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path, conflict_resolution="save-as",
+        )
+        self.assertTrue(ok["success"], f"save-as 应成功: {ok.get('error')}")
+        new_eid = ok["execution_id"]
+        execs = db.list_executions(self.db_path)
+        self.assertEqual(len(execs), 1)
+        self.assertEqual(execs[0]["id"], new_eid)
+        self.assertEqual(execs[0]["template_name"], "EXP_ONLY")
+        self.assertEqual(execs[0]["template_version"], tpl_ver_before)
+        steps = db.get_steps(self.db_path, new_eid)
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["status"], "done")
+        # 操作日志里应有导出记录
+        logs = db.get_operation_logs(self.db_path, action_type="export")
+        self.assertGreaterEqual(len(logs), 1)
+        self.assertEqual(logs[-1]["action_data"]["template_name"], "EXP_ONLY")
+
+        # 再次续跑应该跳过已完成步骤，不重复写日志/文件
+        tpl_again = templates_mod.get_template(self.db_path, self.config, "EXP_ONLY")
+        self._import(self._make_batch("refill"))
+        r2 = batch_mod.run_template(
+            self.db_path, self.config, tpl_again, self.output_dir,
+            allowed_statuses=allowed, execution_id=new_eid,
+        )
+        self.assertTrue(r2["success"])
+        # 之前只有 1 步且已 done，续跑应 skipped_done
+        step_statuses = [s["status"] for s in r2["steps"]]
+        self.assertIn("skipped_done", step_statuses)
+        # 不应产生重复导出日志（同 action_type + same diff_id 数量不变）
+        logs_after = db.get_operation_logs(self.db_path, action_type="export")
+        self.assertEqual(len(logs_after), len(logs))
+
+    def test_abort_on_active_plan_mismatch_alone(self):
+        """只有激活方案不一致（模板未变、文件已清），abort 也应阻塞."""
+        cfg.set_active_plan(self.config, "plan_alpha")
+        cfg.save_runtime_state(self.config)
+        self._import(self._make_batch())
+        self._save_template("PLAN_ONLY", steps=[{"action": "export", "type": "summary"}])
+        template = templates_mod.get_template(self.db_path, self.config, "PLAN_ONLY")
+        allowed = cfg.get_allowed_statuses(self.config)
+        r1 = batch_mod.run_template(
+            self.db_path, self.config, template, self.output_dir,
+            allowed_statuses=allowed,
+        )
+        manifest_path = r1["archive_path"]
+
+        # 切方案
+        cfg.set_active_plan(self.config, "plan_beta")
+        cfg.save_runtime_state(self.config)
+        # 现在 self.config["active_plan"] == "plan_beta" 且 runtime_state.json 已落盘
+        self.assertEqual(self.config.get("active_plan"), "plan_beta")
+
+        # 清 DB/templates/exports，仅留 runtime_state 里的新方案
+        data_dir = os.path.dirname(self.db_path)
+        templates_dir = os.path.join(data_dir, "templates")
+        os.remove(self.db_path)
+        if os.path.isdir(templates_dir):
+            shutil.rmtree(templates_dir)
+        if os.path.isdir(self.output_dir):
+            for fn in os.listdir(self.output_dir):
+                fp = os.path.join(self.output_dir, fn)
+                if os.path.isfile(fp):
+                    os.remove(fp)
+        db.init_db(self.db_path)
+
+        # 用已经切到 plan_beta 的 self.config
+        result = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path, conflict_resolution="abort",
+        )
+        self.assertFalse(result["success"])
+        self.assertTrue(result.get("conflict"))
+        types = [c["type"] for c in result["conflicts"]]
+        self.assertIn("active_plan_mismatch", types)
+        # 只有 plan 冲突，没有其他
+        self.assertNotIn("template_upgraded", types)
+        self.assertNotIn("export_file_exists", types)
+
+        # save-as 可成功，恢复的执行记录里 active_plan 用归档的 plan_alpha
+        ok = archive_mod.restore_execution_from_manifest(
+            self.db_path, self.config, manifest_path, conflict_resolution="save-as",
+        )
+        self.assertTrue(ok["success"])
+        new_exec = db.get_execution(self.db_path, ok["execution_id"])
+        # 归档里记录的 plan 是 plan_alpha，恢复后 DB 里应保存这个值
+        self.assertEqual(new_exec["active_plan"], "plan_alpha")
+        # 但当前运行时的 plan 没被改动，仍是 plan_beta
+        self.assertEqual(self.config.get("active_plan"), "plan_beta")
+        # template-show 能正确显示 plan=plan_alpha
+        rc = self._run_cli("template-show", "PLAN_ONLY")
+        self.assertEqual(rc, 0)
 
     def test_conflict_save_as_on_template_upgrade(self):
         """模板升级冲突时 save-as 策略另存为 <name>_restored."""
@@ -1282,7 +1430,16 @@ class TestArchiveCLI(_BaseTest):
         manifest_path = os.path.join(self.tmpdir, "cli_restore.json")
         self._run_cli("template-export-execution", "CLI_REST", "-o", manifest_path)
 
+        # 清空 DB + templates + exports，纯净环境下 abort 恢复
+        templates_dir = os.path.join(os.path.dirname(self.db_path), "templates")
         os.remove(self.db_path)
+        if os.path.isdir(templates_dir):
+            shutil.rmtree(templates_dir)
+        if os.path.isdir(self.output_dir):
+            for fn in os.listdir(self.output_dir):
+                fp = os.path.join(self.output_dir, fn)
+                if os.path.isfile(fp):
+                    os.remove(fp)
         db.init_db(self.db_path)
 
         rc = self._run_cli("template-restore-execution", manifest_path)
@@ -1332,7 +1489,7 @@ class TestArchiveCLI(_BaseTest):
         ))
 
     def test_cli_restart_delete_db_restore_and_resume(self):
-        """完整链路：执行中断 → 导出归档 → 删 DB → 恢复 → 续跑成功."""
+        """完整链路：执行中断 → 导出归档 → 删 DB(含 exports/templates) → 恢复 → 续跑成功."""
         self._run_cli(
             "template-save", "FULLCHAIN",
             "--steps", "export:summary,export:differences",
@@ -1344,7 +1501,16 @@ class TestArchiveCLI(_BaseTest):
         manifest_path = os.path.join(self.tmpdir, "fullchain_manifest.json")
         self._run_cli("template-export-execution", "FULLCHAIN", "-o", manifest_path)
 
+        # 清空 DB + templates + exports，纯净环境
+        templates_dir = os.path.join(os.path.dirname(self.db_path), "templates")
         os.remove(self.db_path)
+        if os.path.isdir(templates_dir):
+            shutil.rmtree(templates_dir)
+        if os.path.isdir(self.output_dir):
+            for fn in os.listdir(self.output_dir):
+                fp = os.path.join(self.output_dir, fn)
+                if os.path.isfile(fp):
+                    os.remove(fp)
         db.init_db(self.db_path)
 
         rc2 = self._run_cli("template-restore-execution", manifest_path)
