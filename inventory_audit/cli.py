@@ -352,10 +352,15 @@ def cmd_export(args) -> int:
 
     filters = plans_mod.apply_plan_filters(current_plan, status, None, None)
     effective_status = filters["status"]
+    effective_location = filters["location"]
+    effective_sku = filters["sku"]
 
     if export_type == "differences":
         result = exporter.export_differences(
-            db_path, output_dir, status=effective_status,
+            db_path, output_dir,
+            status=effective_status,
+            location=effective_location,
+            sku=effective_sku,
             include_sources=True, plan=current_plan, operator=operator,
         )
     elif export_type == "summary":
@@ -594,6 +599,7 @@ def cmd_replay(args) -> int:
         allowed_statuses=allowed,
         default_conflict_resolution=resolution,
         action_types=action_types,
+        config_for_plan_lookup=config,
     )
 
     if not result["success"] and result.get("aborted"):

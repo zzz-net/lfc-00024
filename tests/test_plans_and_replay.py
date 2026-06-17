@@ -102,6 +102,10 @@ class _BaseTest(unittest.TestCase):
         self._import(csv_path)
         return db.list_differences(self.db_path)[0]["id"]
 
+    def _cli(self, *args):
+        """调用 CLI，自动带上 -c <临时目录 config.json>."""
+        return cli.main(["-c", self.cfg_file, *args])
+
 
 class TestPlanPersistence(_BaseTest):
     """方案持久化：重启后仍可读取，双写数据库 + JSON 落盘."""
@@ -370,10 +374,6 @@ class TestReplayUndoAndConflicts(_BaseTest):
 class TestCliPlanCommands(_BaseTest):
     """CLI 新命令集成测试（plan-save/list/use/delete + set-operator + replay）."""
 
-    def _cli(self, *args):
-        """调用 CLI，自动带上 -c <临时目录 config.json>."""
-        return cli.main(["-c", self.cfg_file, *args])
-
     def test_cli_plan_save_list_use_delete(self):
         """CLI 命令保存/列表/激活/删除方案闭环."""
         csv_path = self._make_batch("cli")
@@ -463,6 +463,244 @@ class TestExportConsistency(_BaseTest):
         types = {l["action_data"].get("export_type") for l in logs}
         self.assertIn("summary", types)
         self.assertIn("sources", types)
+
+
+class TestPlanFilterExportConsistency(_BaseTest):
+    """方案筛选在 list 和 export 链路必须一致（防 regression: 只 list 生效 export 漏了 location/sku）."""
+
+    def test_list_and_export_have_same_count_for_location_filter(self):
+        """方案只看 A- 库位时，list 和 export 的差异条数必须一致."""
+        csv_path = self._make_batch("loc")
+        self._import(csv_path)
+        all_diffs = merger.get_merged_differences(self.db_path)
+        self.assertEqual(len(all_diffs), 2)
+
+        plans_mod.save_plan(
+            self.db_path, self.config, "only-a",
+            filter_location="A-",
+            export_fields=["id", "location", "sku", "total_diff_qty"],
+        )
+        plan = plans_mod.get_plan(self.db_path, self.config, "only-a")
+
+        filtered_list = merger.get_merged_differences(
+            self.db_path, location=plan["filter_location"],
+        )
+        self.assertEqual(len(filtered_list), 1)
+
+        result = exporter.export_differences(
+            self.db_path, self.config["export"]["output_dir"],
+            location=plan["filter_location"],
+            plan=plan, operator="tester",
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["count"], 1, "导出条数必须和 list 筛选结果一致")
+
+    def test_sku_filter_in_export_matches_list(self):
+        """方案按 SKU 筛选时，export 条数必须和 list 一致."""
+        csv_path = self._make_batch("sku")
+        self._import(csv_path)
+
+        plans_mod.save_plan(
+            self.db_path, self.config, "only-sku-a",
+            filter_sku="SKU_A",
+        )
+        plan = plans_mod.get_plan(self.db_path, self.config, "only-sku-a")
+
+        list_count = len(merger.get_merged_differences(
+            self.db_path, sku=plan["filter_sku"],
+        ))
+        result = exporter.export_differences(
+            self.db_path, self.config["export"]["output_dir"],
+            sku=plan["filter_sku"], plan=plan,
+        )
+        self.assertEqual(result["count"], list_count)
+
+    def test_status_and_location_combined_filter_export(self):
+        """状态 + 库位组合筛选，export 必须和 list 一致."""
+        csv_path = self._make_batch("combo")
+        self._import(csv_path)
+
+        plans_mod.save_plan(
+            self.db_path, self.config, "a-pending",
+            filter_status="pending",
+            filter_location="A-",
+        )
+        plan = plans_mod.get_plan(self.db_path, self.config, "a-pending")
+
+        list_count = len(merger.get_merged_differences(
+            self.db_path, status="pending", location="A-",
+        ))
+        result = exporter.export_differences(
+            self.db_path, self.config["export"]["output_dir"],
+            status="pending", location="A-", plan=plan,
+        )
+        self.assertEqual(result["count"], list_count)
+
+    def test_cli_export_respects_plan_filter(self):
+        """CLI export 命令必须应用当前方案的 location/sku 筛选."""
+        csv_path = self._make_batch("cli-f")
+        self._import(csv_path)
+
+        self._cli("plan-save", "cli-only-b", "-l", "B-")
+        self._cli("plan-use", "cli-only-b")
+
+        all_result = exporter.export_differences(
+            self.db_path, self.config["export"]["output_dir"],
+        )
+        self.assertEqual(all_result["count"], 2)
+
+        rc = self._cli("export", "-t", "differences")
+        self.assertEqual(rc, 0)
+
+        export_dir = self.config["export"]["output_dir"]
+        files = [f for f in os.listdir(export_dir) if f.startswith("audit_report_")]
+        plan_files = [f for f in files if "_plan" in f]
+        self.assertTrue(plan_files, "方案激活后导出文件必须带 planID")
+
+        plan_file = max(plan_files, key=lambda f: os.path.getmtime(os.path.join(export_dir, f)))
+        with open(os.path.join(export_dir, plan_file), "r", encoding="utf-8-sig") as f:
+            lines = f.readlines()
+        data_lines = [l for l in lines if not l.startswith("#") and l.strip()]
+        self.assertEqual(len(data_lines) - 1, 1, "按 B- 库位筛选后应只有 1 条差异数据")
+
+
+class TestExportReplayConsistency(_BaseTest):
+    """导出回放一致性：回放出来的导出文件必须和原导出在方案标记、字段、条数、命名上一致."""
+
+    def test_replay_export_preserves_plan_and_operator_in_filename(self):
+        """回放 differences 导出，文件名必须带 planID 和原操作人一致."""
+        csv_path = self._make_batch("rep")
+        self._import(csv_path)
+
+        plans_mod.save_plan(
+            self.db_path, self.config, "replay-plan",
+            filter_location="A-",
+            export_fields=["id", "location", "sku", "status"],
+        )
+        plan = plans_mod.get_plan(self.db_path, self.config, "replay-plan")
+
+        orig = exporter.export_differences(
+            self.db_path, self.config["export"]["output_dir"],
+            location="A-", plan=plan, operator="orig-user",
+        )
+        self.assertTrue(orig["success"])
+        self.assertEqual(orig["count"], 1)
+        self.assertIn(f"_plan{plan['id']}", orig["filename"])
+
+        export_logs = db.get_operation_logs(self.db_path, action_type="export")
+        self.assertEqual(len(export_logs), 1)
+        log = export_logs[0]
+        self.assertEqual(log["plan_name"], "replay-plan")
+        self.assertEqual(log["operator"], "orig-user")
+        self.assertEqual(log["action_data"]["location_filter"], "A-")
+        self.assertEqual(
+            log["action_data"]["export_fields"],
+            ["id", "location", "sku", "status"],
+        )
+
+        os.remove(orig["file_path"])
+
+        replay_dir = os.path.join(self.tmpdir, "replay_exports")
+        result = replay_mod.replay_operations(
+            self.db_path, replay_dir,
+            plan_name="replay-plan",
+            action_types=["export"],
+            config_for_plan_lookup=self.config,
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(len(result["exports"]), 1)
+
+        replayed = result["exports"][0]
+        self.assertIn(f"_plan{plan['id']}", replayed["filename"])
+        self.assertEqual(replayed["count"], 1)
+        self.assertEqual(replayed["plan_name"], "replay-plan")
+
+        with open(replayed["file_path"], "r", encoding="utf-8-sig") as f:
+            header = f.readline()
+        self.assertIn("replay-plan", header)
+        self.assertIn("orig-user", header)
+        self.assertIn("A-", header)
+        self.assertIn("id,location,sku,status", header)
+
+    def test_replay_export_respects_location_and_sku_filters(self):
+        """回放导出必须应用原日志里的 location/sku 筛选，条数和原导出一致."""
+        csv_path = os.path.join(self.tmpdir, "big.csv")
+        _write_csv(
+            csv_path,
+            ["location", "sku", "expected_qty", "counted_qty"],
+            [
+                ["A-01", "X1", "100", "90"],
+                ["A-02", "X2", "50", "45"],
+                ["B-01", "X1", "200", "190"],
+                ["B-02", "Y1", "30", "28"],
+            ],
+        )
+        self._import(csv_path)
+        self.assertEqual(len(merger.get_merged_differences(self.db_path)), 4)
+
+        plans_mod.save_plan(
+            self.db_path, self.config, "b-only",
+            filter_location="B-", filter_sku="X",
+        )
+        plan = plans_mod.get_plan(self.db_path, self.config, "b-only")
+
+        orig = exporter.export_differences(
+            self.db_path, self.config["export"]["output_dir"],
+            location="B-", sku="X", plan=plan, operator="t1",
+        )
+        self.assertEqual(orig["count"], 1)
+
+        replay_dir = os.path.join(self.tmpdir, "rep2")
+        result = replay_mod.replay_operations(
+            self.db_path, replay_dir,
+            plan_id=plan["id"],
+            action_types=["export"],
+            config_for_plan_lookup=self.config,
+        )
+        self.assertTrue(result["success"])
+        self.assertEqual(result["exports"][0]["count"], 1,
+                         "回放导出必须和原导出条数一致（同样的 location+sku 筛选）")
+
+    def test_restart_then_export_still_filtered(self):
+        """重启（重新 load_config）后，激活方案的导出筛选仍然生效."""
+        csv_path = self._make_batch("restart")
+        self._import(csv_path)
+
+        plans_mod.save_plan(
+            self.db_path, self.config, "restart-plan",
+            filter_location="B-",
+            export_fields=["id", "sku", "total_diff_qty"],
+        )
+        cfg.set_active_plan(self.config, "restart-plan")
+        cfg.set_operator(self.config, "restart-user")
+
+        first_export = exporter.export_differences(
+            self.db_path, self.config["export"]["output_dir"],
+            location="B-",
+            plan=plans_mod.get_plan(self.db_path, self.config, "restart-plan"),
+            operator="restart-user",
+        )
+        self.assertEqual(first_export["count"], 1)
+
+        reloaded = cfg.load_config(self.cfg_file)
+        self.assertEqual(reloaded["active_plan"], "restart-plan")
+        self.assertEqual(reloaded["operator"], "restart-user")
+
+        restarted_plan = plans_mod.get_plan(
+            self.db_path, reloaded, "restart-plan",
+        )
+        self.assertIsNotNone(restarted_plan)
+        self.assertEqual(restarted_plan["filter_location"], "B-")
+
+        second_export = exporter.export_differences(
+            self.db_path, reloaded["export"]["output_dir"],
+            location=restarted_plan["filter_location"],
+            plan=restarted_plan,
+            operator=reloaded["operator"],
+        )
+        self.assertEqual(second_export["count"], 1)
+        self.assertEqual(second_export["plan_name"], "restart-plan")
+        self.assertIn(f"_plan{restarted_plan['id']}", second_export["filename"])
 
 
 if __name__ == "__main__":

@@ -151,6 +151,65 @@ python -m inventory_audit remerge [-f]
 
 数据修复用。重新根据来源行计算差异总量，保留已有状态和备注。
 
+### 13. `set-operator` - 设置操作人
+
+```bash
+python -m inventory_audit set-operator <操作人名称>
+```
+
+操作人会被记录到每条状态变更、备注、撤销、导出操作中，并持久化到 `runtime_state.json`，重启后仍生效。
+
+### 14. `plan-save` - 保存复核方案
+
+```bash
+python -m inventory_audit plan-save <方案名> \
+    [-s 状态过滤] [-l 库位过滤] [--sku SKU过滤] \
+    [-f 导出字段(逗号分隔)] [-r 备注模板]
+```
+
+将筛选条件、导出字段、备注模板保存为方案。方案双写到数据库和 `audit_data/plans/<方案名>.json`，即使数据库被重建也能从 JSON 回补。
+
+常用导出字段（默认全部）：`id,location,sku,total_diff_qty,status,remark,batch_names,source_count,created_at,updated_at,merge_key`。
+
+### 15. `plan-list` - 列出所有方案
+
+```bash
+python -m inventory_audit plan-list
+```
+
+显示所有方案名，当前激活方案用 `*` 标记。
+
+### 16. `plan-use` - 激活方案
+
+```bash
+python -m inventory_audit plan-use [方案名]
+```
+
+激活指定方案后，`list`、`export` 会自动套用该方案的筛选条件和导出字段；不带参数则清除激活方案。激活状态落盘到 `runtime_state.json`，重启后续用。
+
+**重要：切换方案只影响视图筛选与导出字段，绝不修改已有批次编号或汇总统计。**
+
+### 17. `plan-delete` - 删除方案
+
+```bash
+python -m inventory_audit plan-delete <方案名>
+```
+
+同时删除数据库记录和 JSON 落盘文件。若该方案正处于激活状态，会一并清除激活。
+
+### 18. `replay` - 按操作日志回放
+
+```bash
+python -m inventory_audit replay [-p 方案名] [-o 操作人] [-r keep|snapshot|abort]
+```
+
+按时间升序回放符合条件的操作日志（状态变更、备注、撤销、导出）。
+
+**冲突处理策略**（同一差异在日志记录后又被其他方案/操作者改动时触发）：
+- `abort`（默认）：遇到冲突立即中止，保留已成功回放的操作
+- `keep`：跳过冲突条目，保留当前数据库状态
+- `snapshot`：将当前差异状态另存为 `exports/snapshot_diff<ID>_<时间戳>_conflict.json`，然后跳过该条
+
 ## 配置说明
 
 配置文件为 JSON 格式，示例见 `samples/config.json`。
@@ -166,6 +225,12 @@ python -m inventory_audit remerge [-f]
 | `csv.delimiter` | CSV 分隔符 | `,` |
 | `status.initial` | 新差异默认状态 | `pending` |
 | `export.output_dir` | 报告输出目录 | `./audit_data/exports` |
+| `active_plan` | 当前激活方案（运行时状态，自动落盘） | `null` |
+| `operator` | 当前操作人（运行时状态，自动落盘） | `cli` |
+
+**运行时状态文件：** `audit_data/runtime_state.json`，保存 `active_plan` 与 `operator`。
+
+**方案落盘目录：** `audit_data/plans/<方案名>.json`，方案 JSON 双写冗余。
 
 ## 数据模型
 
@@ -173,8 +238,11 @@ python -m inventory_audit remerge [-f]
 
 - **批次 (Batch)**: 每次导入的 CSV 对应一个批次，有唯一文件哈希去重
 - **来源行 (Source Line)**: CSV 中的每一行原始数据（有差异的才保留）
-- **差异 (Difference)**: 按「库位 + SKU」合并后的差异记录，关联所有来源行
-- **复核历史 (Review History)**: 每次状态/备注变更的记录，用于撤销
+- **差异 (Difference)**: 按配置 `rules.merge_keys` 合并后的差异记录，关联所有来源行
+- **复核历史 (Review History)**: 每次状态/备注变更的记录，用于撤销；关联 `plan_id` / `plan_name`
+- **复核方案 (Plan)**: 筛选条件、导出字段、备注模板的集合；持久化在数据库 + JSON
+- **操作日志 (Operation Log)**: 所有 status_change / remark_change / undo / export 的不可变记录，用于回放
+- **操作人 (Operator)**: 每条操作的执行者，落盘到 runtime_state.json
 
 ### 状态流转
 
@@ -187,6 +255,14 @@ pending (待处理)
 
 所有状态之间可互相转换，每次变更都可撤销。
 
+### 导出一致性
+
+所有导出 CSV 文件：
+1. 文件名带 `_plan<ID>` 后缀（如激活方案），区分不同方案的导出结果
+2. 首行是元数据注释：`# 导出时间 / 方案 / 操作人 / 状态过滤 / 导出字段`
+3. 差异导出按方案 `export_fields` 决定列顺序，缺失字段自动为空
+4. 导出操作会写入 `operation_logs`，回放时可重新导出相同文件
+
 ## 异常场景处理
 
 | 场景 | 行为 |
@@ -196,8 +272,11 @@ pending (待处理)
 | 零差异行 | 自动跳过，不进入差异库 |
 | 重复导入同一文件 | 提示已导入，返回原批次 ID，不破坏数据 |
 | 撤销空历史 | 返回友好提示，不报错 |
-| 程序中断后重启 | 数据已持久化，继续操作即可 |
-| 多批次合并 | 同一库位+SKU 自动累加差异量，保留所有来源 |
+| 程序中断后重启 | 数据已持久化，继续操作即可；方案/操作人自动恢复 |
+| 多批次合并 | 同一 merge_key 自动累加差异量，保留所有来源 |
+| 切换方案后再导入 | 旧批次 ID、名称、汇总绝对不变，只新增新批次 |
+| 回放遇到跨方案/跨操作者冲突 | 按 `-r` 策略处理：abort / keep / snapshot |
+| 数据库重建但 plans/*.json 还在 | 下次 `get_plan` 自动从 JSON 回补到数据库 |
 
 ## 目录结构
 
@@ -206,12 +285,18 @@ inventory_audit/         # 主包
   __init__.py
   __main__.py
   cli.py                 # CLI 入口
-  config.py              # 配置加载
-  db.py                  # 数据库操作
+  config.py              # 配置加载 + runtime_state 读写
+  db.py                  # 数据库操作（含 plans / operation_logs）
   importer.py            # CSV 导入
   merger.py              # 差异合并与查询
+  plans.py               # 复核方案管理（CRUD + 落盘 + 筛选合并）
+  replay.py              # 操作日志回放 + 冲突检测
   reviewer.py            # 复核操作（状态、备注、撤销）
-  exporter.py            # 报告导出
+  exporter.py            # 报告导出（方案字段 + 一致性元数据）
+
+tests/                   # 测试
+  test_regression.py     # 原有回归测试
+  test_plans_and_replay.py  # 方案 / 回放 / 冲突 / 重启续用 测试
 
 samples/                 # 样例文件
   config.json            # 样例配置
@@ -220,5 +305,8 @@ samples/                 # 样例文件
 
 audit_data/              # 运行时数据（自动创建）
   audit.db               # SQLite 数据库
-  exports/               # 导出报告
+  runtime_state.json     # active_plan + operator 持久化
+  plans/                 # 方案 JSON 双写目录
+    <方案名>.json
+  exports/               # 导出报告 + 冲突快照
 ```

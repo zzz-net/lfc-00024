@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import db
 from . import exporter
+from . import plans as plans_mod
 from . import reviewer
 
 
@@ -144,6 +145,7 @@ def replay_operations(
     default_conflict_resolution: str = CONFLICT_ABORT,
     conflict_callback: Optional[Callable[[Dict[str, Any]], str]] = None,
     action_types: Optional[List[str]] = None,
+    config_for_plan_lookup: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """按时间升序回放 operation_logs 记录.
 
@@ -157,6 +159,7 @@ def replay_operations(
         default_conflict_resolution: 默认冲突处理策略 keep/snapshot/abort
         conflict_callback: 交互式冲突回调，返回策略字符串；None 时用默认
         action_types: 只回放指定动作类型列表（如 ["status_change", "remark_change", "export"]）；None 表示全部
+        config_for_plan_lookup: 用于通过 plan 方案查询的 config（导出回放时重建 plan 对象），可选
 
     Returns:
         {"success", "replayed", "skipped", "conflicts", "aborted", "exports"}
@@ -166,6 +169,15 @@ def replay_operations(
     )
     if action_types:
         logs = [l for l in logs if l.get("action_type") in action_types]
+
+    def _resolve_plan(log_plan_id, log_plan_name):
+        if not log_plan_id and not log_plan_name:
+            return None
+        if config_for_plan_lookup is None:
+            return None
+        if log_plan_name:
+            return plans_mod.get_plan(db_path, config_for_plan_lookup, log_plan_name)
+        return None
 
     replayed: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
@@ -256,15 +268,31 @@ def replay_operations(
         elif action_type == "export":
             export_type = data.get("export_type")
             status_filter = data.get("status_filter")
+            location_filter = data.get("location_filter")
+            sku_filter = data.get("sku_filter")
             batch_id = data.get("batch_id")
+            exp_plan = _resolve_plan(log_plan_id, log_plan_name)
             if export_type == "differences":
                 r = exporter.export_differences(
-                    db_path, output_dir, status=status_filter, include_sources=True,
+                    db_path, output_dir,
+                    status=status_filter,
+                    location=location_filter,
+                    sku=sku_filter,
+                    include_sources=True,
+                    plan=exp_plan,
+                    operator=log_operator,
                 )
             elif export_type == "summary":
-                r = exporter.export_summary(db_path, output_dir)
+                r = exporter.export_summary(
+                    db_path, output_dir,
+                    plan=exp_plan, operator=log_operator,
+                )
             elif export_type == "sources":
-                r = exporter.export_source_lines(db_path, output_dir, batch_id=batch_id)
+                r = exporter.export_source_lines(
+                    db_path, output_dir,
+                    batch_id=batch_id,
+                    plan=exp_plan, operator=log_operator,
+                )
             else:
                 skipped.append({"log": log, "resolution": "unknown_export_type"})
                 continue

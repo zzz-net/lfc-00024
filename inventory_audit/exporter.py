@@ -40,6 +40,8 @@ def export_differences(
     db_path: str,
     output_dir: str,
     status: Optional[str] = None,
+    location: Optional[str] = None,
+    sku: Optional[str] = None,
     include_sources: bool = True,
     filename_prefix: str = "audit_report",
     plan: Optional[Dict[str, Any]] = None,
@@ -50,7 +52,9 @@ def export_differences(
     Args:
         db_path: 数据库路径
         output_dir: 输出目录
-        status: 按状态过滤，None 表示全部（方案优先级低于显式传参）
+        status: 按状态过滤，None 表示全部
+        location: 按库位过滤（模糊匹配前缀），None 表示全部
+        sku: 按 SKU 过滤（模糊匹配），None 表示全部
         include_sources: 是否包含来源行明细
         filename_prefix: 文件名前缀
         plan: 当前方案，用于驱动导出字段与文件名元数据
@@ -63,7 +67,9 @@ def export_differences(
 
     export_fields = plans_mod.resolve_export_fields(plan)
 
-    diffs = merger.get_merged_differences(db_path, status=status)
+    diffs = merger.get_merged_differences(
+        db_path, status=status, location=location, sku=sku,
+    )
 
     if not diffs:
         result = {
@@ -88,6 +94,8 @@ def export_differences(
             "方案:", plan["name"] if plan else "(无)",
             "操作人:", operator,
             "状态过滤:", status or "(全部)",
+            "库位过滤:", location or "(全部)",
+            "SKU过滤:", sku or "(全部)",
             "导出字段:", ",".join(export_fields),
         ])
 
@@ -121,7 +129,8 @@ def export_differences(
     db.log_export_operation(
         db_path, "differences", abs_path, len(diffs),
         operator=operator, plan_id=plan_id, plan_name=plan_name,
-        status_filter=status,
+        status_filter=status, location_filter=location, sku_filter=sku,
+        export_fields=export_fields,
     )
 
     return {

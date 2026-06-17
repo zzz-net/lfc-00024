@@ -820,7 +820,10 @@ def log_export_operation(
     plan_id: Optional[int] = None,
     plan_name: Optional[str] = None,
     status_filter: Optional[str] = None,
+    location_filter: Optional[str] = None,
+    sku_filter: Optional[str] = None,
     batch_id: Optional[int] = None,
+    export_fields: Optional[List[str]] = None,
 ) -> None:
     """记录导出操作到 operation_logs.
 
@@ -833,14 +836,20 @@ def log_export_operation(
         plan_id: 方案 ID
         plan_name: 方案名称
         status_filter: 状态过滤
+        location_filter: 库位过滤
+        sku_filter: SKU 过滤
         batch_id: 批次 ID
+        export_fields: 导出字段列表（仅 differences 类型有）
     """
     action_data = json.dumps({
         "export_type": export_type,
         "file_path": file_path,
         "count": count,
         "status_filter": status_filter,
+        "location_filter": location_filter,
+        "sku_filter": sku_filter,
         "batch_id": batch_id,
+        "export_fields": export_fields,
     }, ensure_ascii=False)
     with get_conn(db_path) as conn:
         conn.execute(
