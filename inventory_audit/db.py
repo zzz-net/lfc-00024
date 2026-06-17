@@ -100,6 +100,58 @@ CREATE TABLE IF NOT EXISTS operation_logs (
 CREATE INDEX IF NOT EXISTS idx_op_log_plan ON operation_logs(plan_id);
 CREATE INDEX IF NOT EXISTS idx_op_log_created ON operation_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_op_log_target ON operation_logs(target_diff_id);
+
+CREATE TABLE IF NOT EXISTS templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    version INTEGER NOT NULL DEFAULT 1,
+    description TEXT,
+    filters TEXT,
+    export_fields TEXT,
+    remark_template TEXT,
+    steps TEXT,
+    content_hash TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS template_executions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER,
+    template_name TEXT,
+    template_version INTEGER,
+    template_snapshot TEXT,
+    status TEXT DEFAULT 'running',
+    steps_total INTEGER NOT NULL DEFAULT 0,
+    steps_done INTEGER NOT NULL DEFAULT 0,
+    steps_failed INTEGER NOT NULL DEFAULT 0,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    finished_at TIMESTAMP,
+    FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tpl_exec_tpl ON template_executions(template_id);
+CREATE INDEX IF NOT EXISTS idx_tpl_exec_status ON template_executions(status);
+
+CREATE TABLE IF NOT EXISTS template_execution_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_id INTEGER NOT NULL,
+    step_index INTEGER NOT NULL,
+    step TEXT NOT NULL,
+    status TEXT DEFAULT 'pending',
+    result TEXT,
+    error TEXT,
+    started_at TIMESTAMP,
+    finished_at TIMESTAMP,
+    UNIQUE(execution_id, step_index),
+    FOREIGN KEY (execution_id) REFERENCES template_executions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tpl_step_exec ON template_execution_steps(execution_id);
+"""
+
+TEMPLATE_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_tpl_name ON templates(name);
 """
 
 INDEX_MERGE_KEY_SQL = (
@@ -128,8 +180,10 @@ def init_db(db_path: str) -> None:
         conn.executescript(SCHEMA_SQL)
         _migrate_differences_table(conn)
         _migrate_review_history_table(conn)
+        _migrate_template_executions_table(conn)
         conn.execute(INDEX_MERGE_KEY_SQL)
         conn.executescript(POST_MIGRATION_INDEX_SQL)
+        conn.execute(TEMPLATE_INDEX_SQL)
         conn.commit()
 
 
@@ -141,6 +195,16 @@ def _migrate_review_history_table(conn) -> None:
         conn.execute("ALTER TABLE review_history ADD COLUMN plan_id INTEGER")
     if "plan_name" not in col_names:
         conn.execute("ALTER TABLE review_history ADD COLUMN plan_name TEXT")
+
+
+def _migrate_template_executions_table(conn) -> None:
+    """迁移旧版 template_executions 表：补充 template_snapshot 列."""
+    cols = conn.execute("PRAGMA table_info(template_executions)").fetchall()
+    col_names = {c["name"] for c in cols}
+    if "template_snapshot" not in col_names:
+        conn.execute(
+            "ALTER TABLE template_executions ADD COLUMN template_snapshot TEXT"
+        )
 
 
 def _migrate_differences_table(conn) -> None:
@@ -824,6 +888,9 @@ def log_export_operation(
     sku_filter: Optional[str] = None,
     batch_id: Optional[int] = None,
     export_fields: Optional[List[str]] = None,
+    template_id: Optional[int] = None,
+    template_name: Optional[str] = None,
+    template_version: Optional[int] = None,
 ) -> None:
     """记录导出操作到 operation_logs.
 
@@ -840,6 +907,9 @@ def log_export_operation(
         sku_filter: SKU 过滤
         batch_id: 批次 ID
         export_fields: 导出字段列表（仅 differences 类型有）
+        template_id: 模板 ID（批量执行时记录）
+        template_name: 模板名称
+        template_version: 模板版本
     """
     action_data = json.dumps({
         "export_type": export_type,
@@ -850,6 +920,9 @@ def log_export_operation(
         "sku_filter": sku_filter,
         "batch_id": batch_id,
         "export_fields": export_fields,
+        "template_id": template_id,
+        "template_name": template_name,
+        "template_version": template_version,
     }, ensure_ascii=False)
     with get_conn(db_path) as conn:
         conn.execute(
@@ -909,5 +982,291 @@ def get_operation_logs(
                 d["action_data"] = json.loads(d["action_data"])
             if d.get("snapshot_before"):
                 d["snapshot_before"] = json.loads(d["snapshot_before"])
+            result.append(d)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# 复核方案模板 (templates) 与批量执行记录
+# ---------------------------------------------------------------------------
+
+def save_template(
+    db_path: str,
+    name: str,
+    version: int,
+    description: Optional[str],
+    filters: Dict[str, Any],
+    export_fields: Optional[List[str]],
+    remark_template: Optional[str],
+    steps: List[Dict[str, Any]],
+    content_hash: str,
+) -> int:
+    """保存或更新复核方案模板（按 name 唯一）.
+
+    Args:
+        db_path: 数据库路径
+        name: 模板名称（唯一）
+        version: 模板版本号
+        description: 模板描述
+        filters: 筛选条件 {status, location, sku}
+        export_fields: 导出字段列表
+        remark_template: 备注模板
+        steps: 批量执行步骤列表
+        content_hash: 内容指纹（用于冲突检测）
+
+    Returns:
+        模板 ID
+    """
+    filters_json = json.dumps(filters, ensure_ascii=False)
+    fields_json = json.dumps(export_fields, ensure_ascii=False) if export_fields else None
+    steps_json = json.dumps(steps, ensure_ascii=False)
+    with get_conn(db_path) as conn:
+        row = conn.execute("SELECT id FROM templates WHERE name = ?", (name,)).fetchone()
+        if row:
+            conn.execute(
+                """UPDATE templates SET
+                   version = ?, description = ?, filters = ?,
+                   export_fields = ?, remark_template = ?, steps = ?,
+                   content_hash = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (version, description, filters_json, fields_json,
+                 remark_template, steps_json, content_hash, row["id"]),
+            )
+            conn.commit()
+            return row["id"]
+        cursor = conn.execute(
+            """INSERT INTO templates
+               (name, version, description, filters, export_fields,
+                remark_template, steps, content_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (name, version, description, filters_json, fields_json,
+             remark_template, steps_json, content_hash),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def _row_to_template(row) -> Dict[str, Any]:
+    d = dict(row)
+    if d.get("filters"):
+        d["filters"] = json.loads(d["filters"])
+    else:
+        d["filters"] = {}
+    if d.get("export_fields"):
+        d["export_fields"] = json.loads(d["export_fields"])
+    if d.get("steps"):
+        d["steps"] = json.loads(d["steps"])
+    else:
+        d["steps"] = []
+    return d
+
+
+def get_template(db_path: str, name: str) -> Optional[Dict[str, Any]]:
+    """按名称获取模板."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM templates WHERE name = ?", (name,)
+        ).fetchone()
+        return _row_to_template(row) if row else None
+
+
+def get_template_by_id(db_path: str, template_id: int) -> Optional[Dict[str, Any]]:
+    """按 ID 获取模板."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM templates WHERE id = ?", (template_id,)
+        ).fetchone()
+        return _row_to_template(row) if row else None
+
+
+def list_templates(db_path: str) -> List[Dict[str, Any]]:
+    """列出所有模板（按更新时间倒序）."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM templates ORDER BY updated_at DESC"
+        ).fetchall()
+        return [_row_to_template(r) for r in rows]
+
+
+def delete_template(db_path: str, name: str) -> bool:
+    """删除模板."""
+    with get_conn(db_path) as conn:
+        cursor = conn.execute("DELETE FROM templates WHERE name = ?", (name,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def create_execution(
+    db_path: str,
+    template_id: Optional[int],
+    template_name: str,
+    template_version: int,
+    steps_total: int,
+    template_snapshot: Optional[Dict[str, Any]] = None,
+) -> int:
+    """创建一条批量执行记录，冻结模板快照，返回 execution_id."""
+    snapshot_json = json.dumps(template_snapshot, ensure_ascii=False) if template_snapshot else None
+    with get_conn(db_path) as conn:
+        cursor = conn.execute(
+            """INSERT INTO template_executions
+               (template_id, template_name, template_version,
+                template_snapshot, status, steps_total, steps_done, steps_failed)
+               VALUES (?, ?, ?, ?, 'running', ?, 0, 0)""",
+            (template_id, template_name, template_version, snapshot_json, steps_total),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_execution(db_path: str, execution_id: int) -> Optional[Dict[str, Any]]:
+    """获取执行记录（含冻结的模板快照）."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM template_executions WHERE id = ?",
+            (execution_id,),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("template_snapshot"):
+            d["template_snapshot"] = json.loads(d["template_snapshot"])
+        return d
+
+
+def list_executions(
+    db_path: str,
+    template_id: Optional[int] = None,
+    template_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """列出执行记录（按开始时间倒序）."""
+    query = "SELECT * FROM template_executions WHERE 1=1"
+    params: List[Any] = []
+    if template_id is not None:
+        query += " AND template_id = ?"
+        params.append(template_id)
+    if template_name is not None:
+        query += " AND template_name = ?"
+        params.append(template_name)
+    query += " ORDER BY started_at DESC, id DESC"
+    with get_conn(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def update_execution(
+    db_path: str,
+    execution_id: int,
+    status: Optional[str] = None,
+    steps_done: Optional[int] = None,
+    steps_failed: Optional[int] = None,
+    finished: bool = False,
+) -> None:
+    """更新执行记录状态."""
+    with get_conn(db_path) as conn:
+        sets = []
+        params: List[Any] = []
+        if status is not None:
+            sets.append("status = ?")
+            params.append(status)
+        if steps_done is not None:
+            sets.append("steps_done = ?")
+            params.append(steps_done)
+        if steps_failed is not None:
+            sets.append("steps_failed = ?")
+            params.append(steps_failed)
+        if finished:
+            sets.append("finished_at = CURRENT_TIMESTAMP")
+        if not sets:
+            return
+        params.append(execution_id)
+        conn.execute(
+            f"UPDATE template_executions SET {', '.join(sets)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
+
+
+def upsert_step(
+    db_path: str,
+    execution_id: int,
+    step_index: int,
+    step: Dict[str, Any],
+    status: str,
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+    started: bool = False,
+    finished: bool = False,
+) -> None:
+    """插入或更新某一步的执行状态（UNIQUE(execution_id, step_index) 保证幂等）."""
+    step_json = json.dumps(step, ensure_ascii=False)
+    result_json = json.dumps(result, ensure_ascii=False) if result is not None else None
+    with get_conn(db_path) as conn:
+        existing = conn.execute(
+            "SELECT id FROM template_execution_steps "
+            "WHERE execution_id = ? AND step_index = ?",
+            (execution_id, step_index),
+        ).fetchone()
+        if existing:
+            sets = ["status = ?", "result = ?", "error = ?"]
+            params: List[Any] = [status, result_json, error]
+            if started:
+                sets.append("started_at = CURRENT_TIMESTAMP")
+            if finished:
+                sets.append("finished_at = CURRENT_TIMESTAMP")
+            params += [existing["id"]]
+            conn.execute(
+                f"UPDATE template_execution_steps SET {', '.join(sets)} "
+                "WHERE id = ?",
+                params,
+            )
+        else:
+            conn.execute(
+                """INSERT INTO template_execution_steps
+                   (execution_id, step_index, step, status, result, error,
+                    started_at, finished_at)
+                   VALUES (?, ?, ?, ?, ?, ?,
+                           CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                (execution_id, step_index, step_json, status, result_json, error),
+            )
+        conn.commit()
+
+
+def get_step(
+    db_path: str,
+    execution_id: int,
+    step_index: int,
+) -> Optional[Dict[str, Any]]:
+    """获取某一步的执行记录."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM template_execution_steps "
+            "WHERE execution_id = ? AND step_index = ?",
+            (execution_id, step_index),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("step"):
+            d["step"] = json.loads(d["step"])
+        if d.get("result"):
+            d["result"] = json.loads(d["result"])
+        return d
+
+
+def get_steps(db_path: str, execution_id: int) -> List[Dict[str, Any]]:
+    """获取某次执行的所有步骤记录（按 step_index 升序）."""
+    with get_conn(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM template_execution_steps "
+            "WHERE execution_id = ? ORDER BY step_index ASC",
+            (execution_id,),
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            if d.get("step"):
+                d["step"] = json.loads(d["step"])
+            if d.get("result"):
+                d["result"] = json.loads(d["result"])
             result.append(d)
         return result

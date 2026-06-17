@@ -1,5 +1,6 @@
 """CLI 入口 - 仓库盘点差异复核工具."""
 import argparse
+import json
 import os
 import sys
 from typing import Any, Dict, List, Optional
@@ -12,6 +13,8 @@ from . import plans as plans_mod
 from . import replay as replay_mod
 from . import reviewer
 from . import exporter
+from . import templates as templates_mod
+from . import batch as batch_mod
 
 
 def _load_config(args) -> Dict[str, Any]:
@@ -626,6 +629,277 @@ def cmd_replay(args) -> int:
     return 0
 
 
+def _parse_steps(args) -> Optional[List[Dict[str, Any]]]:
+    """从 --steps-file(JSON) 或 --steps(逗号简写) 解析步骤；均为空时返回默认步骤.
+
+    简写：list / export(=differences) / export:summary / export:sources / replay
+    """
+    steps_file = getattr(args, "steps_file", None)
+    if steps_file:
+        try:
+            with open(steps_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"[ERROR] 读取步骤文件失败：{e}")
+            return None
+        if not isinstance(data, list):
+            print(f"[ERROR] 步骤文件根结构必须是数组：{steps_file}")
+            return None
+        return data
+
+    steps_str = getattr(args, "steps", None)
+    if steps_str:
+        steps: List[Dict[str, Any]] = []
+        for token in steps_str.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if token == "list":
+                steps.append({"action": "list"})
+            elif token == "export":
+                steps.append({"action": "export", "type": "differences"})
+            elif token.startswith("export:"):
+                steps.append({"action": "export", "type": token.split(":", 1)[1]})
+            elif token == "replay":
+                steps.append({"action": "replay"})
+            else:
+                print(f"[ERROR] 未知步骤简写：{token}（允许 list/export/export:summary/replay）")
+                return None
+        return steps
+
+    return [
+        {"action": "list"},
+        {"action": "export", "type": "differences"},
+        {"action": "export", "type": "summary"},
+    ]
+
+
+def cmd_template_save(args) -> int:
+    """保存复核方案模板（筛选/导出字段/回放动作，版本化）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    filters = {
+        "status": getattr(args, "status", None),
+        "location": getattr(args, "location", None),
+        "sku": getattr(args, "sku", None),
+    }
+    export_fields = getattr(args, "fields", None)
+    if export_fields:
+        export_fields = [f.strip() for f in export_fields.split(",") if f.strip()]
+    remark_template = getattr(args, "remark_template", None)
+    description = getattr(args, "description", None)
+    force = getattr(args, "force", False)
+
+    steps = _parse_steps(args)
+    if steps is None:
+        return 1
+
+    result = templates_mod.save_template(
+        db_path, config, name,
+        filters=filters, export_fields=export_fields,
+        remark_template=remark_template, steps=steps,
+        description=description, force=force,
+    )
+
+    if not result.get("success"):
+        if result.get("conflict"):
+            print(f"[冲突] {result['message']}")
+            print(f"  已存在版本: v{result.get('existing_version')}")
+            print(f"  使用 --force 显式覆盖（将 bump 版本，已有执行记录保留旧版本）")
+        else:
+            print(f"[ERROR] {result.get('error', '保存失败')}")
+        return 1
+
+    action = result.get("action", "created")
+    tag = {"created": "已创建", "overwritten": "已覆盖更新", "unchanged": "无变更"}[action]
+    print(f"[OK] 模板 {name} {tag}（v{result['version']}，ID={result['template_id']}）")
+    print(f"  步骤数: {len(steps)}")
+    for i, s in enumerate(steps):
+        print(f"    {i}. {s.get('action')}{'/' + s.get('type','') if s.get('type') else ''}")
+    return 0
+
+
+def cmd_template_list(args) -> int:
+    """列出所有模板."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    templates = templates_mod.list_templates(db_path)
+    if not templates:
+        print("暂无模板")
+        return 0
+
+    print(f"共 {len(templates)} 个模板:")
+    print("-" * 80)
+    print(f"{'ID':<4} {'名称':<20} {'版本':<6} {'步骤':<4} {'更新时间':<20}")
+    print("-" * 80)
+    for t in templates:
+        print(f"{t['id']:<4} {t['name']:<20} v{t.get('version', 1):<5} "
+              f"{len(t.get('steps', [])):<4} {t.get('updated_at', ''):<20}")
+    return 0
+
+
+def cmd_template_show(args) -> int:
+    """查看模板详情（含冻结的执行记录与版本漂移检查）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    template = templates_mod.get_template(db_path, config, name)
+    if not template:
+        print(f"[ERROR] 模板不存在：{name}")
+        return 1
+
+    print(f"=== 模板: {template['name']} (ID={template['id']}, v{template.get('version', 1)}) ===")
+    if template.get("description"):
+        print(f"描述: {template['description']}")
+    filters = template.get("filters", {})
+    print(f"筛选: status={filters.get('status') or '-'}, "
+          f"location={filters.get('location') or '-'}, sku={filters.get('sku') or '-'}")
+    if template.get("export_fields"):
+        print(f"导出字段: {', '.join(template['export_fields'])}")
+    if template.get("remark_template"):
+        print(f"备注模板: {template['remark_template']}")
+    print(f"内容指纹: {template.get('content_hash', '')[:16]}...")
+    print(f"\n执行步骤 ({len(template.get('steps', []))} 步):")
+    for i, s in enumerate(template.get("steps", [])):
+        detail = s.get("type") or (",".join(s.get("action_types", [])) if s.get("action_types") else "")
+        print(f"  {i}. {s.get('action')}" + (f" [{detail}]" if detail else ""))
+
+    execs = db.list_executions(db_path, template_id=template["id"])
+    if execs:
+        print(f"\n执行记录 ({len(execs)} 条):")
+        for e in execs:
+            print(f"  #{e['id']} v{e.get('template_version')} "
+                  f"{e.get('status')} "
+                  f"完成 {e.get('steps_done')}/{e.get('steps_total')} "
+                  f"失败 {e.get('steps_failed')}")
+    return 0
+
+
+def cmd_template_delete(args) -> int:
+    """删除模板（数据库 + JSON 文件）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+
+    name = args.name
+    ok = templates_mod.delete_template(db_path, config, name)
+    if not ok:
+        print(f"[WARN] 模板不存在或删除失败：{name}")
+        return 0
+    print(f"[OK] 模板 {name} 已删除")
+    return 0
+
+
+def cmd_template_import(args) -> int:
+    """从 JSON 配置文件导入模板（处理重名与内容冲突）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    force = getattr(args, "force", False)
+    result = templates_mod.import_template(db_path, config, args.file, force=force)
+    if not result.get("success"):
+        if result.get("conflict"):
+            print(f"[冲突] {result['message']}")
+            print(f"  已存在版本: v{result.get('existing_version')}")
+            print(f"  使用 --force 显式覆盖")
+        else:
+            print(f"[ERROR] {result.get('error', '导入失败')}")
+        return 1
+
+    action = result.get("action", "created")
+    tag = {"created": "已导入（新建）", "overwritten": "已覆盖更新",
+           "unchanged": "内容未变化"}[action]
+    print(f"[OK] 模板 {result.get('message', '')}")
+    print(f"  操作: {tag}，当前版本 v{result.get('version')}")
+    return 0
+
+
+def cmd_template_export(args) -> int:
+    """把模板导出为 JSON 配置文件（可分享/备份）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+
+    result = templates_mod.export_template(db_path, config, args.name, args.file)
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error', '导出失败')}")
+        return 1
+    print(f"[OK] 模板 {args.name} 已导出")
+    print(f"  文件: {result['file_path']}")
+    return 0
+
+
+def cmd_template_run(args) -> int:
+    """按模板批量执行 list/export/replay（支持续跑）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    template = templates_mod.get_template(db_path, config, name)
+    if not template:
+        print(f"[ERROR] 模板不存在：{name}")
+        return 1
+
+    output_dir = os.path.abspath(config["export"]["output_dir"])
+    allowed = cfg.get_allowed_statuses(config)
+    operator = config.get("operator", "cli")
+
+    execution_id = getattr(args, "execution_id", None)
+    resume = getattr(args, "resume", False)
+
+    if resume and execution_id is None:
+        execs = db.list_executions(db_path, template_id=template["id"])
+        pending = [e for e in execs if e.get("status") != "completed"]
+        if not pending:
+            print(f"[ERROR] 模板 {name} 没有可续跑的执行记录")
+            return 1
+        execution_id = pending[0]["id"]
+        print(f"[INFO] 续跑执行记录 #{execution_id}")
+
+    result = batch_mod.run_template(
+        db_path, config, template, output_dir,
+        allowed_statuses=allowed, operator=operator,
+        execution_id=execution_id,
+    )
+
+    if not result.get("success") and result.get("error"):
+        print(f"[ERROR] {result['error']}")
+        return 1
+
+    if result.get("version_drift"):
+        print(f"[WARN] 版本漂移：{result['version_drift']['message']}")
+
+    status = result["status"]
+    eid = result["execution_id"]
+    print(f"[{'OK' if status == 'completed' else 'INTERRUPT'}] "
+          f"执行 #{eid} {status}："
+          f"完成 {result['steps_done']}/{result['steps_total']}，"
+          f"失败 {result['steps_failed']}")
+    for s in result["steps"]:
+        step = s["step"]
+        label = step.get("action") + (f"/{step.get('type')}" if step.get("type") else "")
+        if s["status"] == "skipped_done":
+            print(f"  #{s['step_index']} {label}: 跳过（已完成，未重复执行）")
+        elif s["status"] == "done":
+            r = s.get("result", {})
+            extra = f" -> {r.get('file_path')}" if r.get("file_path") else ""
+            print(f"  #{s['step_index']} {label}: 完成{extra}")
+        else:
+            print(f"  #{s['step_index']} {label}: 失败 - {s.get('error')}")
+
+    if status != "completed":
+        print(f"\n[提示] 使用 'template-run {name} --resume' 续跑（已完成步骤不会重复执行）")
+        return 2
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器."""
     parser = argparse.ArgumentParser(
@@ -740,6 +1014,71 @@ def build_parser() -> argparse.ArgumentParser:
         help="只回放指定动作类型（逗号分隔）, 如: status_change,remark_change,export,undo",
     )
     p_replay.set_defaults(func=cmd_replay)
+
+    # --- 模板（复核方案模板 + 批量执行） ---
+    p_tpl_save = subparsers.add_parser(
+        "template-save", help="保存复核方案模板（筛选/导出字段/回放动作，版本化）",
+    )
+    p_tpl_save.add_argument("name", help="模板名称（唯一）")
+    p_tpl_save.add_argument("-s", "--status", help="状态过滤", default=None)
+    p_tpl_save.add_argument("-l", "--location", help="库位过滤", default=None)
+    p_tpl_save.add_argument("--sku", help="SKU 过滤", default=None)
+    p_tpl_save.add_argument(
+        "-f", "--fields", help="导出字段（逗号分隔）", default=None,
+    )
+    p_tpl_save.add_argument("-r", "--remark-template", help="备注模板", default=None)
+    p_tpl_save.add_argument("-d", "--description", help="模板描述", default=None)
+    p_tpl_save.add_argument(
+        "--steps", help="步骤简写（逗号分隔: list,export,export:summary,replay）",
+        default=None,
+    )
+    p_tpl_save.add_argument(
+        "--steps-file", help="步骤定义文件(JSON 数组，优先于 --steps)", default=None,
+    )
+    p_tpl_save.add_argument(
+        "--force", action="store_true",
+        help="内容冲突时强制覆盖（bump 版本，已有执行记录保留旧版本）",
+    )
+    p_tpl_save.set_defaults(func=cmd_template_save)
+
+    p_tpl_list = subparsers.add_parser("template-list", help="列出所有模板")
+    p_tpl_list.set_defaults(func=cmd_template_list)
+
+    p_tpl_show = subparsers.add_parser("template-show", help="查看模板详情")
+    p_tpl_show.add_argument("name", help="模板名称")
+    p_tpl_show.set_defaults(func=cmd_template_show)
+
+    p_tpl_del = subparsers.add_parser("template-delete", help="删除模板")
+    p_tpl_del.add_argument("name", help="模板名称")
+    p_tpl_del.set_defaults(func=cmd_template_delete)
+
+    p_tpl_import = subparsers.add_parser(
+        "template-import", help="从 JSON 文件导入模板（处理重名/冲突）",
+    )
+    p_tpl_import.add_argument("file", help="模板配置文件路径(JSON)")
+    p_tpl_import.add_argument(
+        "--force", action="store_true", help="内容冲突时强制覆盖",
+    )
+    p_tpl_import.set_defaults(func=cmd_template_import)
+
+    p_tpl_export = subparsers.add_parser(
+        "template-export", help="把模板导出为 JSON 配置文件",
+    )
+    p_tpl_export.add_argument("name", help="模板名称")
+    p_tpl_export.add_argument("file", help="输出文件路径(JSON)")
+    p_tpl_export.set_defaults(func=cmd_template_export)
+
+    p_tpl_run = subparsers.add_parser(
+        "template-run", help="按模板批量执行 list/export/replay（支持续跑）",
+    )
+    p_tpl_run.add_argument("name", help="模板名称")
+    p_tpl_run.add_argument(
+        "--execution-id", type=int, default=None, help="续跑指定执行记录 ID",
+    )
+    p_tpl_run.add_argument(
+        "--resume", action="store_true", help="续跑最近一次未完成的执行",
+    )
+    p_tpl_run.set_defaults(func=cmd_template_run)
 
     return parser
 

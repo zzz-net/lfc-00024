@@ -36,6 +36,25 @@ def _build_row(diff: Dict[str, Any], field: str) -> Any:
     return diff.get(field, "")
 
 
+def _resolve_export_fields(
+    plan: Optional[Dict[str, Any]],
+    template: Optional[Dict[str, Any]],
+) -> List[str]:
+    """解析导出字段：模板优先于方案，均无则用默认字段集."""
+    if template and template.get("export_fields"):
+        return list(template["export_fields"])
+    return plans_mod.resolve_export_fields(plan)
+
+
+def _template_filename_part(template: Optional[Dict[str, Any]]) -> str:
+    """模板在文件名中的标识片段，如 _tpl2v1；无模板时为空串."""
+    if not template:
+        return ""
+    tid = template.get("id")
+    tver = template.get("version", 1)
+    return f"_tpl{tid}v{tver}"
+
+
 def export_differences(
     db_path: str,
     output_dir: str,
@@ -46,6 +65,7 @@ def export_differences(
     filename_prefix: str = "audit_report",
     plan: Optional[Dict[str, Any]] = None,
     operator: str = "cli",
+    template: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """导出差异报告为 CSV.
 
@@ -59,13 +79,14 @@ def export_differences(
         filename_prefix: 文件名前缀
         plan: 当前方案，用于驱动导出字段与文件名元数据
         operator: 操作人（用于操作日志）
+        template: 复核方案模板，用于批量执行时在文件名/元数据/日志中记录模板与版本
 
     Returns:
         导出结果
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    export_fields = plans_mod.resolve_export_fields(plan)
+    export_fields = _resolve_export_fields(plan, template)
 
     diffs = merger.get_merged_differences(
         db_path, status=status, location=location, sku=sku,
@@ -83,13 +104,14 @@ def export_differences(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     status_part = f"_{status}" if status else "_all"
     plan_part = f"_plan{plan['id']}" if plan else ""
-    filename = f"{filename_prefix}{status_part}{plan_part}_{timestamp}.csv"
+    tpl_part = _template_filename_part(template)
+    filename = f"{filename_prefix}{status_part}{plan_part}{tpl_part}_{timestamp}.csv"
     file_path = os.path.join(output_dir, filename)
 
     with open(file_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
 
-        writer.writerow([
+        meta_row = [
             "# 导出时间:", datetime.now().isoformat(timespec="seconds"),
             "方案:", plan["name"] if plan else "(无)",
             "操作人:", operator,
@@ -97,7 +119,10 @@ def export_differences(
             "库位过滤:", location or "(全部)",
             "SKU过滤:", sku or "(全部)",
             "导出字段:", ",".join(export_fields),
-        ])
+        ]
+        if template:
+            meta_row += ["模板:", template.get("name"), "版本:", f"v{template.get('version', 1)}"]
+        writer.writerow(meta_row)
 
         headers = [FIELD_LABELS.get(f, f) for f in export_fields]
         if include_sources:
@@ -126,11 +151,15 @@ def export_differences(
     abs_path = os.path.abspath(file_path)
     plan_id = plan["id"] if plan else None
     plan_name = plan["name"] if plan else None
+    tpl_name = template.get("name") if template else None
+    tpl_version = template.get("version") if template else None
+    tpl_id = template.get("id") if template else None
     db.log_export_operation(
         db_path, "differences", abs_path, len(diffs),
         operator=operator, plan_id=plan_id, plan_name=plan_name,
         status_filter=status, location_filter=location, sku_filter=sku,
         export_fields=export_fields,
+        template_id=tpl_id, template_name=tpl_name, template_version=tpl_version,
     )
 
     return {
@@ -140,6 +169,9 @@ def export_differences(
         "filename": filename,
         "plan_id": plan_id,
         "plan_name": plan_name,
+        "template_id": tpl_id,
+        "template_name": tpl_name,
+        "template_version": tpl_version,
     }
 
 
@@ -149,6 +181,7 @@ def export_summary(
     filename_prefix: str = "summary",
     plan: Optional[Dict[str, Any]] = None,
     operator: str = "cli",
+    template: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """导出汇总统计报告.
 
@@ -158,6 +191,7 @@ def export_summary(
         filename_prefix: 文件名前缀
         plan: 当前方案（写入元数据）
         operator: 操作人
+        template: 复核方案模板（写入元数据与日志）
 
     Returns:
         导出结果
@@ -169,16 +203,20 @@ def export_summary(
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     plan_part = f"_plan{plan['id']}" if plan else ""
-    filename = f"{filename_prefix}{plan_part}_{timestamp}.csv"
+    tpl_part = _template_filename_part(template)
+    filename = f"{filename_prefix}{plan_part}{tpl_part}_{timestamp}.csv"
     file_path = os.path.join(output_dir, filename)
 
     with open(file_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
+        meta_row = [
             "# 导出时间:", datetime.now().isoformat(timespec="seconds"),
             "方案:", plan["name"] if plan else "(无)",
             "操作人:", operator,
-        ])
+        ]
+        if template:
+            meta_row += ["模板:", template.get("name"), "版本:", f"v{template.get('version', 1)}"]
+        writer.writerow(meta_row)
 
         writer.writerow(["=== 总体汇总 ==="])
         writer.writerow(["指标", "数值"])
@@ -214,9 +252,13 @@ def export_summary(
     abs_path = os.path.abspath(file_path)
     plan_id = plan["id"] if plan else None
     plan_name = plan["name"] if plan else None
+    tpl_name = template.get("name") if template else None
+    tpl_version = template.get("version") if template else None
+    tpl_id = template.get("id") if template else None
     db.log_export_operation(
         db_path, "summary", abs_path, summary["total_differences"],
         operator=operator, plan_id=plan_id, plan_name=plan_name,
+        template_id=tpl_id, template_name=tpl_name, template_version=tpl_version,
     )
 
     return {
@@ -226,6 +268,9 @@ def export_summary(
         "summary": summary,
         "plan_id": plan_id,
         "plan_name": plan_name,
+        "template_id": tpl_id,
+        "template_name": tpl_name,
+        "template_version": tpl_version,
     }
 
 
@@ -236,6 +281,7 @@ def export_source_lines(
     filename_prefix: str = "source_lines",
     plan: Optional[Dict[str, Any]] = None,
     operator: str = "cli",
+    template: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """导出来源行明细.
 
@@ -246,6 +292,7 @@ def export_source_lines(
         filename_prefix: 文件名前缀
         plan: 当前方案（写入元数据）
         operator: 操作人
+        template: 复核方案模板（写入元数据与日志）
 
     Returns:
         导出结果
@@ -281,17 +328,21 @@ def export_source_lines(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     batch_part = f"_batch{batch_id}" if batch_id else "_all"
     plan_part = f"_plan{plan['id']}" if plan else ""
-    filename = f"{filename_prefix}{batch_part}{plan_part}_{timestamp}.csv"
+    tpl_part = _template_filename_part(template)
+    filename = f"{filename_prefix}{batch_part}{plan_part}{tpl_part}_{timestamp}.csv"
     file_path = os.path.join(output_dir, filename)
 
     with open(file_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
+        meta_row = [
             "# 导出时间:", datetime.now().isoformat(timespec="seconds"),
             "方案:", plan["name"] if plan else "(无)",
             "操作人:", operator,
             "批次:", batch_id or "(全部)",
-        ])
+        ]
+        if template:
+            meta_row += ["模板:", template.get("name"), "版本:", f"v{template.get('version', 1)}"]
+        writer.writerow(meta_row)
         writer.writerow([
             "行ID", "批次名称", "行号", "库位", "SKU",
             "账面数量", "实盘数量", "差异数量",
@@ -311,10 +362,14 @@ def export_source_lines(
     abs_path = os.path.abspath(file_path)
     plan_id = plan["id"] if plan else None
     plan_name = plan["name"] if plan else None
+    tpl_name = template.get("name") if template else None
+    tpl_version = template.get("version") if template else None
+    tpl_id = template.get("id") if template else None
     db.log_export_operation(
         db_path, "sources", abs_path, len(rows),
         operator=operator, plan_id=plan_id, plan_name=plan_name,
         batch_id=batch_id,
+        template_id=tpl_id, template_name=tpl_name, template_version=tpl_version,
     )
 
     return {
@@ -324,4 +379,7 @@ def export_source_lines(
         "filename": filename,
         "plan_id": plan_id,
         "plan_name": plan_name,
+        "template_id": tpl_id,
+        "template_name": tpl_name,
+        "template_version": tpl_version,
     }
