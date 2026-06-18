@@ -16,6 +16,7 @@ from . import merger
 from . import plans as plans_mod
 from . import replay as replay_mod
 from . import reviewer
+from . import session_archive as session_archive_mod
 from . import templates as templates_mod
 
 
@@ -1228,6 +1229,188 @@ def cmd_template_restore_execution(args) -> int:
 
 
 # ============================================================================
+# 审计会话归档包 (session-archive-*)
+# ============================================================================
+
+def cmd_session_archive_create(args) -> int:
+    """创建审计会话归档包 - 打包数据库/配置/导出报表/操作日志为可搬走的 zip."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    output = getattr(args, "output", None)
+    operator = config.get("operator", "cli")
+
+    result = session_archive_mod.create_session_archive(
+        db_path, config,
+        config_file_path=getattr(args, "config", None),
+        output_path=output,
+        operator=operator,
+    )
+
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error', '归档失败')}")
+        return 1
+
+    summary = result["summary"]
+    db_info = summary["database"]
+    print(f"[OK] 审计会话归档已创建")
+    print(f"  归档文件: {result['archive_path']}")
+    print(f"  归档版本: v{result['manifest']['$archive_version']}，工具版本: {result['manifest']['tool_version']}")
+    print(f"  操作人: {result['manifest']['operator']}，激活方案: {result['manifest'].get('active_plan') or '(无)'}")
+    print(f"  数据库: {db_info['size_bytes']} 字节")
+    rc = db_info.get("row_counts", {})
+    print(f"  行数摘要: 批次 {rc.get('batches', 0)} / 差异 {rc.get('differences', 0)} / "
+          f"来源行 {rc.get('source_lines', 0)} / 操作日志 {rc.get('operation_logs', 0)}")
+    print(f"  导出报表: {len(summary.get('exports', []))} 个")
+    print(f"  方案/模板: plans={len(summary.get('plans', []))}, "
+          f"templates={len(summary.get('templates', []))}, "
+          f"batch_templates={len(summary.get('batch_templates', []))}")
+    print(f"  归档总文件数: {summary.get('total_files', 0)}")
+    print()
+    print("[后续操作]")
+    print(f"  查看归档内容: session-archive-info {os.path.basename(result['archive_path'])}")
+    print(f"  恢复到新目录: session-archive-restore {os.path.basename(result['archive_path'])} "
+          f"--target-dir <目标目录>")
+    return 0
+
+
+def cmd_session_archive_info(args) -> int:
+    """列出归档内容摘要 - 不恢复，先看清归档里带了什么."""
+    archive = args.archive
+    result = session_archive_mod.list_archive_contents(archive)
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error', '读取归档失败')}")
+        return 1
+
+    manifest = result["manifest"]
+    summary = result["summary"]
+    db_info = summary.get("database", {})
+
+    print("=" * 70)
+    print("=== 审计会话归档内容摘要 ===")
+    print("=" * 70)
+    print(f"归档文件: {result['archive_path']}")
+    print(f"归档版本: v{manifest.get('$archive_version')}（当前工具支持 "
+          f"{', '.join('v' + str(v) for v in session_archive_mod.SUPPORTED_ARCHIVE_VERSIONS)}）")
+    print(f"工具版本: {manifest.get('tool_version')}")
+    print(f"创建时间: {manifest.get('created_at')}")
+    print(f"操作人: {manifest.get('operator') or '-'}，激活方案: {manifest.get('active_plan') or '(无)'}")
+    src = manifest.get("source", {})
+    print(f"来源: 数据库 {src.get('db_path') or '-'}")
+    if src.get("config_file"):
+        print(f"      配置文件 {src.get('config_file')}")
+    print()
+
+    print("--- 数据库 ---")
+    print(f"  归档路径: {db_info.get('archive_path')}")
+    print(f"  大小: {db_info.get('size_bytes', 0)} 字节")
+    rc = db_info.get("row_counts", {})
+    if rc:
+        print(f"  行数: " + ", ".join(f"{k}={v}" for k, v in rc.items()))
+    print()
+
+    exports = summary.get("exports", [])
+    print(f"--- 导出报表 ({len(exports)} 个) ---")
+    for ef in exports[:5]:
+        print(f"  {ef.get('filename')} ({ef.get('size_bytes', 0)} 字节)")
+    if len(exports) > 5:
+        print(f"  ... 还有 {len(exports) - 5} 个")
+    print()
+
+    plans = summary.get("plans", [])
+    templates = summary.get("templates", [])
+    batch_templates = summary.get("batch_templates", [])
+    print(f"--- 方案/模板 ---")
+    print(f"  plans ({len(plans)}): {', '.join(plans) if plans else '(无)'}")
+    print(f"  templates ({len(templates)}): {', '.join(templates) if templates else '(无)'}")
+    print(f"  batch_templates ({len(batch_templates)}): {', '.join(batch_templates) if batch_templates else '(无)'}")
+    print(f"  runtime_state: {'已包含' if summary.get('runtime_state_present') else '未包含'}")
+    print(f"  operation_logs: {summary.get('operation_logs_count', 0)} 条（DB 内 + data/operation_logs.json 留档）")
+    print(f"  归档总文件数: {summary.get('total_files', 0)}")
+    print("=" * 70)
+    return 0
+
+
+def cmd_session_archive_restore(args) -> int:
+    """从归档恢复到新工作目录 - 支持 --conflict abort|rename|overwrite."""
+    archive = args.archive
+    target_dir = getattr(args, "target_dir", None)
+    conflict = getattr(args, "conflict", "abort")
+    operator = None
+
+    # 先加载配置以取得操作人记录到恢复日志
+    config = _load_config(args)
+    operator = config.get("operator", "cli")
+
+    if target_dir is None:
+        print("[ERROR] 恢复必须指定 --target-dir 目标工作目录")
+        return 1
+
+    # 恢复前先预检，给用户看清冲突
+    preview = session_archive_mod.read_archive_manifest(archive)
+    if not preview.get("success"):
+        print(f"[ERROR] {preview.get('error', '归档读取失败')}")
+        return 1
+    manifest = preview["manifest"]
+    print(f"[INFO] 正在恢复归档: {os.path.basename(archive)}")
+    print(f"  归档版本 v{manifest.get('$archive_version')}，创建于 {manifest.get('created_at')}")
+    print(f"  来源操作人: {manifest.get('operator') or '-'}，激活方案: {manifest.get('active_plan') or '(无)'}")
+
+    conflicts = session_archive_mod.detect_restore_conflicts(archive, target_dir)
+    if conflicts:
+        print(f"[WARN] 检测到 {len(conflicts)} 项目标冲突:")
+        for c in conflicts:
+            print(f"  - [{c['type']}] {c['message']}")
+            print(f"      → {c['resolution']}")
+        if conflict == "abort":
+            print("[INFO] 当前策略为 abort，已中止（未改动任何数据）。")
+            print("  使用 --conflict rename 另存，或 --conflict overwrite 覆盖后再恢复。")
+
+    result = session_archive_mod.restore_session_archive(
+        archive, target_dir, conflict=conflict, operator=operator,
+    )
+
+    if not result.get("success"):
+        if result.get("conflict"):
+            print("[冲突] 恢复中止，未改动任何数据：")
+            for c in result["conflicts"]:
+                print(f"  ! [{c['type']}] {c['message']}")
+            print()
+            print("  可用冲突处理策略：")
+            print("    --conflict abort     : 中止（默认），不改动任何数据")
+            print("    --conflict rename    : 恢复到 audit_data_restored/ 与 config_restored.json，保留现有数据")
+            print("    --conflict overwrite : 直接覆盖已有数据库与配置文件")
+            return 2
+        else:
+            print(f"[ERROR] {result.get('error', '恢复失败')}")
+        return 1
+
+    if result.get("renamed"):
+        print(f"[INFO] 检测到冲突，已按 rename 策略另存：")
+        print(f"  数据目录: {result['audit_data_dir']}（原 audit_data 保留不动）")
+        print(f"  配置文件: {result['config_path']}（原 config.json 保留不动）")
+    print(f"[OK] 审计会话已恢复到: {result['target_root']}")
+    print(f"  数据库: {result['db_path']}")
+    print(f"  配置文件: {result['config_path']}")
+    print(f"  恢复文件数: {result['restored_files']}")
+    rc = result.get("row_counts", {})
+    if rc:
+        print(f"  恢复后行数: 批次 {rc.get('batches', 0)} / 差异 {rc.get('differences', 0)} / "
+              f"操作日志 {rc.get('operation_logs', 0)}")
+    if result.get("logged"):
+        print(f"  恢复动作已写入操作日志 (session_restore)")
+    print()
+    print("[后续操作] 在新工作目录继续工作（注意相对路径以工作目录为基准）：")
+    print(f"  cd {result['target_root']}")
+    print(f"  python -m inventory_audit -c config.json list")
+    print(f"  python -m inventory_audit -c config.json show 1")
+    print(f"  python -m inventory_audit -c config.json export -t differences")
+    print(f"  python -m inventory_audit -c config.json undo")
+    return 0
+
+
+# ============================================================================
 # 批量任务模板 (batch-template-*)
 # ============================================================================
 
@@ -1735,6 +1918,46 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_tpl_restore_exec.set_defaults(func=cmd_template_restore_execution)
+
+    # --- 审计会话归档包 (session-archive-*) ---
+    p_sa_create = subparsers.add_parser(
+        "session-archive-create",
+        help="创建审计会话归档包：打包数据库/配置/导出报表/操作日志为可搬走的 zip",
+    )
+    p_sa_create.add_argument(
+        "-o", "--output", default=None,
+        help="自定义输出路径(.zip)；不传则自动生成到 <audit_data>/archives/session_<操作人>_<时间戳>.zip",
+    )
+    p_sa_create.set_defaults(func=cmd_session_archive_create)
+
+    p_sa_info = subparsers.add_parser(
+        "session-archive-info",
+        help="列出归档内容摘要（不恢复）：数据库/导出报表/方案模板/操作日志统计",
+    )
+    p_sa_info.add_argument("archive", help="归档文件路径(.zip)")
+    p_sa_info.set_defaults(func=cmd_session_archive_info)
+
+    p_sa_restore = subparsers.add_parser(
+        "session-archive-restore",
+        help="从归档恢复到新工作目录，恢复后可继续 list/show/export/undo",
+    )
+    p_sa_restore.add_argument("archive", help="归档文件路径(.zip)")
+    p_sa_restore.add_argument(
+        "--target-dir", default=None,
+        help="恢复目标工作目录（不存在会自动创建）",
+    )
+    p_sa_restore.add_argument(
+        "--conflict",
+        choices=["abort", "rename", "overwrite"],
+        default="abort",
+        help=(
+            "冲突处理策略（遇到已有数据库或同名配置时）："
+            "abort(中止,默认) — 不改动任何数据；"
+            "rename(另存) — 恢复到 audit_data_restored/ 与 config_restored.json，保留现有数据；"
+            "overwrite(覆盖) — 直接覆盖已有数据库与配置文件"
+        ),
+    )
+    p_sa_restore.set_defaults(func=cmd_session_archive_restore)
 
     # --- 批量任务模板 (batch-template-*) ---
     p_bt_save = subparsers.add_parser(
