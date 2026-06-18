@@ -31,6 +31,16 @@ def _get_db_path(config: Dict[str, Any]) -> str:
     return cfg.get_db_path(config)
 
 
+def _launcher_path() -> str:
+    """返回仓库根目录下 inventory-audit 启动器的绝对路径.
+
+    用于 session-archive-restore 恢复后给用户打印可直接执行的后续命令——
+    统一指向启动器，避免提示 `python -m inventory_audit` 却在离开源码树后失效。
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(repo_root, "inventory-audit")
+
+
 def _resolve_current_plan(config: Dict[str, Any], db_path: str) -> Optional[Dict[str, Any]]:
     """根据 config.active_plan 解析出方案对象；不存在或未设置返回 None."""
     plan_name = config.get("active_plan")
@@ -47,7 +57,7 @@ def cmd_init(args) -> int:
     cfg.save_runtime_state(config)
     print(f"[OK] 初始化完成")
     print(f"  数据库: {db_path}")
-    print(f"  导出目录: {os.path.abspath(config['export']['output_dir'])}")
+    print(f"  导出目录: {cfg.get_export_dir(config)}")
     print(f"  操作人: {config.get('operator', 'cli')}")
     return 0
 
@@ -351,7 +361,7 @@ def cmd_export(args) -> int:
     db_path = _get_db_path(config)
     current_plan = _resolve_current_plan(config, db_path)
 
-    output_dir = os.path.abspath(config["export"]["output_dir"])
+    output_dir = cfg.get_export_dir(config)
     status = getattr(args, "status", None)
     export_type = getattr(args, "type", "differences")
     operator = config.get("operator", "cli")
@@ -580,7 +590,7 @@ def cmd_replay(args) -> int:
     db_path = _get_db_path(config)
     db.init_db(db_path)
 
-    output_dir = os.path.abspath(config["export"]["output_dir"])
+    output_dir = cfg.get_export_dir(config)
     allowed = cfg.get_allowed_statuses(config)
 
     plan_name = getattr(args, "plan", None)
@@ -862,7 +872,7 @@ def cmd_template_run(args) -> int:
         print(f"[ERROR] 模板不存在：{name}")
         return 1
 
-    output_dir = os.path.abspath(config["export"]["output_dir"])
+    output_dir = cfg.get_export_dir(config)
     allowed = cfg.get_allowed_statuses(config)
     operator = config.get("operator", "cli")
 
@@ -1401,12 +1411,14 @@ def cmd_session_archive_restore(args) -> int:
     if result.get("logged"):
         print(f"  恢复动作已写入操作日志 (session_restore)")
     print()
-    print("[后续操作] 在新工作目录继续工作（注意相对路径以工作目录为基准）：")
+    launcher = _launcher_path()
+    print("[后续操作] 在新工作目录继续工作（配置中的相对路径以 config.json 所在目录为基准）：")
     print(f"  cd {result['target_root']}")
-    print(f"  python -m inventory_audit -c config.json list")
-    print(f"  python -m inventory_audit -c config.json show 1")
-    print(f"  python -m inventory_audit -c config.json export -t differences")
-    print(f"  python -m inventory_audit -c config.json undo")
+    print(f"  python {launcher} -c config.json list")
+    print(f"  python {launcher} -c config.json show 1")
+    print(f"  python {launcher} -c config.json export -t differences")
+    print(f"  python {launcher} -c config.json undo")
+    print("  （启动器无需 PYTHONPATH；在源码树内也可继续用 python -m inventory_audit ...）")
     return 0
 
 

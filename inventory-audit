@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""inventory-audit —— 盘点复核 CLI 的稳定命令入口。
+
+本脚本是启动主链路的第一环（命令入口 + 环境探测 + 共享加载收敛点）：
+从**自身所在目录**（即仓库根目录，`inventory_audit/` 包的父目录）自举 sys.path，
+因此无需安装、无需设置 PYTHONPATH，从任意工作目录都能运行：
+
+    python /path/to/inventory-audit --help
+    python /path/to/inventory-audit -c /anywhere/config.json list
+
+配置文件中的相对路径（database.path / export.output_dir）以**配置文件所在目录**
+为基准解析（见 inventory_audit.config.load_config），所以「在哪执行」与
+「数据落在哪」解耦——把归档恢复到新目录后，直接 `-c <新目录>/config.json`
+即可定位到新目录里的数据，无需 cd。
+
+入口与 `python -m inventory_audit`（源码树内可用）最终都汇聚到
+inventory_audit.cli.main，保证两条入口行为一致。
+"""
+import os
+import sys
+
+
+def _bootstrap_sys_path() -> None:
+    """把本脚本所在目录（仓库根，含 inventory_audit 包）加到 sys.path 前端。
+
+    只在尚未存在时插入，避免覆盖用户已有配置；这样离开源码目录执行也不会
+    因为找不到包而报 No module named inventory_audit。
+    """
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+
+_bootstrap_sys_path()
+
+from inventory_audit.cli import main  # noqa: E402  (须在 sys.path 自举后导入)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
