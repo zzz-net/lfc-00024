@@ -90,9 +90,10 @@ python -m unittest discover -s tests -v
 ## 目录结构
 
 ```
+inventory-audit          # 顶层启动器（命令入口：自举 sys.path 后委托 cli.main）
 inventory_audit/         # 主包
-  cli.py                 # CLI 入口
-  config.py              # 配置加载 + runtime_state 读写
+  cli.py                 # CLI 入口（build_parser / main）
+  config.py              # 配置加载 + 路径解析（相对路径以配置文件目录为基准）+ runtime_state 读写
   db.py                  # 数据库操作（plans / operation_logs / templates / executions）
   importer.py            # CSV 导入
   merger.py              # 差异合并与查询
@@ -105,8 +106,9 @@ inventory_audit/         # 主包
   reviewer.py            # 复核操作（状态、备注、撤销）
   exporter.py            # 报告导出
 tests/                   # 测试
+  test_cli_startup_chain.py  # 启动与归档恢复主链路回归（子进程冷启动/跨重启/恢复后执行）
 samples/                 # 样例配置与盘点 CSV
-audit_data/              # 运行时数据（自动创建）
+audit_data/              # 运行时数据（自动创建，跟随 config.json 所在目录）
 ```
 
 详见 [USAGE.md](USAGE.md)。
