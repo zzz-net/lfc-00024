@@ -115,6 +115,31 @@ CREATE TABLE IF NOT EXISTS templates (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS batch_task_templates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    disabled INTEGER NOT NULL DEFAULT 0,
+    execution_params TEXT,
+    env_whitelist TEXT,
+    export_options TEXT,
+    conflict_strategy TEXT DEFAULT 'abort',
+    content_hash TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS batch_template_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    template_id INTEGER,
+    template_name TEXT NOT NULL,
+    snapshot_before TEXT,
+    action TEXT NOT NULL,
+    operator TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (template_id) REFERENCES batch_task_templates(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS template_executions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     template_id INTEGER,
@@ -1327,3 +1352,195 @@ def get_steps(db_path: str, execution_id: int) -> List[Dict[str, Any]]:
                 d["result"] = json.loads(d["result"])
             result.append(d)
         return result
+
+
+# ============================================================================
+# 批量任务模板 (batch_task_templates)
+# ============================================================================
+
+VALID_CONFLICT_STRATEGIES = ("abort", "save-as", "overwrite")
+
+
+def _row_to_batch_template(row) -> Dict[str, Any]:
+    d = dict(row)
+    for key in ("execution_params", "env_whitelist", "export_options"):
+        if d.get(key):
+            try:
+                d[key] = json.loads(d[key])
+            except (json.JSONDecodeError, TypeError):
+                d[key] = None
+    d["disabled"] = bool(d.get("disabled", 0))
+    return d
+
+
+def save_batch_template(
+    db_path: str,
+    name: str,
+    description: Optional[str],
+    execution_params: Optional[Dict[str, Any]],
+    env_whitelist: Optional[List[str]],
+    export_options: Optional[Dict[str, Any]],
+    conflict_strategy: str,
+    content_hash: str,
+    disabled: bool = False,
+    existing_id: Optional[int] = None,
+) -> int:
+    """保存或更新批量任务模板（按 name 唯一）."""
+    params_json = json.dumps(execution_params, ensure_ascii=False) if execution_params else None
+    env_json = json.dumps(env_whitelist, ensure_ascii=False) if env_whitelist else None
+    export_json = json.dumps(export_options, ensure_ascii=False) if export_options else None
+
+    with get_conn(db_path) as conn:
+        if existing_id is not None:
+            conn.execute(
+                """UPDATE batch_task_templates SET
+                   description = ?, execution_params = ?, env_whitelist = ?,
+                   export_options = ?, conflict_strategy = ?, content_hash = ?,
+                   disabled = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (description, params_json, env_json, export_json,
+                 conflict_strategy, content_hash, 1 if disabled else 0,
+                 existing_id),
+            )
+            conn.commit()
+            return existing_id
+
+        row = conn.execute(
+            "SELECT id FROM batch_task_templates WHERE name = ?", (name,)
+        ).fetchone()
+        if row:
+            conn.execute(
+                """UPDATE batch_task_templates SET
+                   description = ?, execution_params = ?, env_whitelist = ?,
+                   export_options = ?, conflict_strategy = ?, content_hash = ?,
+                   disabled = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (description, params_json, env_json, export_json,
+                 conflict_strategy, content_hash, 1 if disabled else 0,
+                 row["id"]),
+            )
+            conn.commit()
+            return row["id"]
+
+        cursor = conn.execute(
+            """INSERT INTO batch_task_templates
+               (name, description, execution_params, env_whitelist,
+                export_options, conflict_strategy, content_hash, disabled)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (name, description, params_json, env_json, export_json,
+             conflict_strategy, content_hash, 1 if disabled else 0),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_batch_template(db_path: str, name: str) -> Optional[Dict[str, Any]]:
+    """按名称获取批量任务模板."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM batch_task_templates WHERE name = ?", (name,)
+        ).fetchone()
+        return _row_to_batch_template(row) if row else None
+
+
+def get_batch_template_by_id(db_path: str, template_id: int) -> Optional[Dict[str, Any]]:
+    """按 ID 获取批量任务模板."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM batch_task_templates WHERE id = ?", (template_id,)
+        ).fetchone()
+        return _row_to_batch_template(row) if row else None
+
+
+def list_batch_templates(db_path: str, include_disabled: bool = True) -> List[Dict[str, Any]]:
+    """列出所有批量任务模板（按更新时间倒序）."""
+    query = "SELECT * FROM batch_task_templates"
+    params: List[Any] = []
+    if not include_disabled:
+        query += " WHERE disabled = 0"
+    query += " ORDER BY updated_at DESC"
+    with get_conn(db_path) as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [_row_to_batch_template(r) for r in rows]
+
+
+def delete_batch_template(db_path: str, name: str) -> bool:
+    """删除批量任务模板."""
+    with get_conn(db_path) as conn:
+        cursor = conn.execute("DELETE FROM batch_task_templates WHERE name = ?", (name,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def set_batch_template_disabled(db_path: str, name: str, disabled: bool) -> bool:
+    """启用/禁用批量任务模板."""
+    with get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE batch_task_templates SET disabled = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+            (1 if disabled else 0, name),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+def rename_batch_template(db_path: str, old_name: str, new_name: str) -> bool:
+    """重命名批量任务模板."""
+    with get_conn(db_path) as conn:
+        cursor = conn.execute(
+            "UPDATE batch_task_templates SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?",
+            (new_name, old_name),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
+# ============================================================================
+# 批量任务模板历史 (batch_template_history) — 用于撤销
+# ============================================================================
+
+def append_batch_template_history(
+    db_path: str,
+    template_id: int,
+    template_name: str,
+    snapshot_before: Optional[Dict[str, Any]],
+    action: str,
+    operator: Optional[str] = None,
+) -> int:
+    """追加一条变更历史，用于 undo."""
+    snapshot_json = json.dumps(snapshot_before, ensure_ascii=False) if snapshot_before else None
+    with get_conn(db_path) as conn:
+        cursor = conn.execute(
+            """INSERT INTO batch_template_history
+               (template_id, template_name, snapshot_before, action, operator)
+               VALUES (?, ?, ?, ?, ?)""",
+            (template_id, template_name, snapshot_json, action, operator),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_last_batch_template_history(db_path: str, template_name: str) -> Optional[Dict[str, Any]]:
+    """获取指定模板最近一条变更历史（用于撤销）."""
+    with get_conn(db_path) as conn:
+        row = conn.execute(
+            """SELECT * FROM batch_template_history
+               WHERE template_name = ? ORDER BY id DESC LIMIT 1""",
+            (template_name,),
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d.get("snapshot_before"):
+            try:
+                d["snapshot_before"] = json.loads(d["snapshot_before"])
+            except (json.JSONDecodeError, TypeError):
+                d["snapshot_before"] = None
+        return d
+
+
+def delete_batch_template_history(db_path: str, history_id: int) -> bool:
+    """删除某条历史记录（撤销成功后清理）."""
+    with get_conn(db_path) as conn:
+        cursor = conn.execute("DELETE FROM batch_template_history WHERE id = ?", (history_id,))
+        conn.commit()
+        return cursor.rowcount > 0

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from . import archive as archive_mod
 from . import batch as batch_mod
+from . import batch_templates as bt_mod
 from . import config as cfg
 from . import db
 from . import exporter
@@ -1226,6 +1227,290 @@ def cmd_template_restore_execution(args) -> int:
     return 0
 
 
+# ============================================================================
+# 批量任务模板 (batch-template-*)
+# ============================================================================
+
+def _parse_json_arg(s: Optional[str]) -> Optional[Dict[str, Any]]:
+    """解析 JSON 字符串为 dict，失败返回 None 并打印错误."""
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] JSON 解析失败: {e}")
+        return None
+
+
+def cmd_bt_save(args) -> int:
+    """保存（新增或修改）批量任务模板."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    description = getattr(args, "description", None)
+
+    execution_params = _parse_json_arg(getattr(args, "params", None))
+    if getattr(args, "params", None) is not None and execution_params is None:
+        return 1
+    if not isinstance(execution_params, dict):
+        execution_params = None
+
+    env_whitelist = getattr(args, "env", None)
+    if env_whitelist:
+        env_whitelist = [e.strip() for e in env_whitelist.split(",") if e.strip()]
+
+    export_options = _parse_json_arg(getattr(args, "export_opts", None))
+    if getattr(args, "export_opts", None) is not None and export_options is None:
+        return 1
+    if not isinstance(export_options, dict):
+        export_options = None
+
+    conflict_strategy = getattr(args, "conflict_default", "abort")
+    disabled = getattr(args, "disabled", False)
+    operator = config.get("operator", "cli")
+
+    result = bt_mod.save_batch_template(
+        db_path, config, name,
+        description=description,
+        execution_params=execution_params,
+        env_whitelist=env_whitelist,
+        export_options=export_options,
+        conflict_strategy=conflict_strategy,
+        disabled=disabled,
+        operator=operator,
+    )
+
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error', '保存失败')}")
+        return 1
+
+    action = result.get("action", "create")
+    action_cn = {"create": "已创建", "modify": "已修改", "unchanged": "无变更"}.get(action, action)
+    print(f"[OK] 批量任务模板 {name} {action_cn}（ID={result['template_id']}）")
+    tpl = bt_mod.get_batch_template(db_path, config, name)
+    if tpl:
+        if tpl.get("description"):
+            print(f"  描述: {tpl['description']}")
+        if tpl.get("execution_params"):
+            print(f"  执行参数: {json.dumps(tpl['execution_params'], ensure_ascii=False)}")
+        if tpl.get("env_whitelist"):
+            print(f"  环境变量白名单: {', '.join(tpl['env_whitelist'])}")
+        if tpl.get("export_options"):
+            print(f"  导出选项: {json.dumps(tpl['export_options'], ensure_ascii=False)}")
+        print(f"  默认冲突策略: {tpl.get('conflict_strategy', 'abort')}")
+        print(f"  状态: {'禁用' if tpl.get('disabled') else '启用'}")
+    return 0
+
+
+def cmd_bt_list(args) -> int:
+    """列出批量任务模板."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    include_disabled = not getattr(args, "all", True)
+
+    templates = bt_mod.list_batch_templates(db_path, include_disabled=include_disabled)
+    if not templates:
+        print("暂无批量任务模板")
+        return 0
+
+    print(f"共 {len(templates)} 个批量任务模板:")
+    print("-" * 80)
+    print(f"{'ID':<4} {'名称':<24} {'状态':<6} {'冲突策略':<10} {'更新时间':<20}")
+    print("-" * 80)
+    for t in templates:
+        status = "禁用" if t.get("disabled") else "启用"
+        print(f"{t['id']:<4} {t['name']:<24} {status:<6} "
+              f"{t.get('conflict_strategy', 'abort'):<10} {t.get('updated_at', ''):<20}")
+    return 0
+
+
+def cmd_bt_show(args) -> int:
+    """查看批量任务模板详情."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    tpl = bt_mod.get_batch_template(db_path, config, name)
+    if not tpl:
+        print(f"[ERROR] 批量任务模板不存在：{name}")
+        return 1
+
+    print(f"=== 批量任务模板: {tpl['name']} (ID={tpl['id']}) ===")
+    if tpl.get("description"):
+        print(f"描述: {tpl['description']}")
+    print(f"状态: {'禁用' if tpl.get('disabled') else '启用'}")
+    print(f"默认冲突策略: {tpl.get('conflict_strategy', 'abort')}")
+    print(f"内容指纹: {tpl.get('content_hash', '')[:16]}...")
+    if tpl.get("execution_params"):
+        print(f"\n执行参数:")
+        print(f"  {json.dumps(tpl['execution_params'], ensure_ascii=False, indent=2)}")
+    if tpl.get("env_whitelist"):
+        print(f"\n环境变量白名单 ({len(tpl['env_whitelist'])} 项):")
+        for e in tpl["env_whitelist"]:
+            print(f"  - {e}")
+    if tpl.get("export_options"):
+        print(f"\n导出选项:")
+        print(f"  {json.dumps(tpl['export_options'], ensure_ascii=False, indent=2)}")
+    print(f"\n创建时间: {tpl.get('created_at', '')}")
+    print(f"更新时间: {tpl.get('updated_at', '')}")
+    return 0
+
+
+def cmd_bt_delete(args) -> int:
+    """删除批量任务模板（可 undo）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    operator = config.get("operator", "cli")
+    result = bt_mod.delete_batch_template(db_path, config, name, operator=operator)
+    if not result.get("success"):
+        print(f"[WARN] {result.get('error', '删除失败')}")
+        return 0
+    print(f"[OK] {result['message']}")
+    if result.get("action") == "deleted":
+        print(f"  ID: {result['template_id']}")
+        print(f"  [提示] 可用 batch-template-undo {name} 撤销此次删除")
+    return 0
+
+
+def cmd_bt_disable(args) -> int:
+    """禁用批量任务模板."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    operator = config.get("operator", "cli")
+    result = bt_mod.set_batch_template_disabled(
+        db_path, config, name, disabled=True, operator=operator,
+    )
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error', '禁用失败')}")
+        return 1
+    print(f"[OK] {result['message']}")
+    if result.get("action") != "unchanged":
+        print(f"  [提示] 可用 batch-template-undo {name} 撤销此次禁用")
+    return 0
+
+
+def cmd_bt_enable(args) -> int:
+    """启用批量任务模板."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    operator = config.get("operator", "cli")
+    result = bt_mod.set_batch_template_disabled(
+        db_path, config, name, disabled=False, operator=operator,
+    )
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error', '启用失败')}")
+        return 1
+    print(f"[OK] {result['message']}")
+    if result.get("action") != "unchanged":
+        print(f"  [提示] 可用 batch-template-undo {name} 撤销此次启用")
+    return 0
+
+
+def cmd_bt_copy(args) -> int:
+    """复制批量任务模板."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    src_name = args.source
+    dst_name = args.destination
+    operator = config.get("operator", "cli")
+
+    result = bt_mod.copy_batch_template(
+        db_path, config, src_name, dst_name, operator=operator,
+    )
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error', '复制失败')}")
+        return 1
+
+    print(f"[OK] {result['message']}")
+    return 0
+
+
+def cmd_bt_undo(args) -> int:
+    """撤销批量任务模板的最近一次变更."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    operator = config.get("operator", "cli")
+    result = bt_mod.undo_last_batch_template_change(
+        db_path, config, name, operator=operator,
+    )
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error', '撤销失败')}")
+        return 1
+    print(f"[OK] {result['message']}")
+    return 0
+
+
+def cmd_bt_export(args) -> int:
+    """导出批量任务模板为 JSON 文件."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    name = args.name
+    file_path = args.file
+    result = bt_mod.export_batch_template(db_path, config, name, file_path)
+    if not result.get("success"):
+        print(f"[ERROR] {result.get('error', '导出失败')}")
+        return 1
+    print(f"[OK] 批量任务模板 {name} 已导出")
+    print(f"  文件: {result['file_path']}")
+    return 0
+
+
+def cmd_bt_import(args) -> int:
+    """从 JSON 文件导入批量任务模板（带冲突策略）."""
+    config = _load_config(args)
+    db_path = _get_db_path(config)
+    db.init_db(db_path)
+
+    file_path = args.file
+    conflict = getattr(args, "conflict", "abort")
+    operator = config.get("operator", "cli")
+
+    result = bt_mod.import_batch_template(
+        db_path, config, file_path, conflict=conflict, operator=operator,
+    )
+
+    if not result.get("success"):
+        if result.get("conflict"):
+            print(f"[冲突] {result['message']}")
+            return 2
+        print(f"[ERROR] {result.get('error', '导入失败')}")
+        return 1
+
+    action = result.get("action", "create")
+    action_cn = {
+        "create": "已导入（新建）",
+        "modify": "已覆盖更新",
+        "unchanged": "内容未变化，跳过",
+    }.get(action, action)
+    print(f"[OK] {result['message']}")
+    print(f"  操作: {action_cn}")
+    print(f"  模板名: {result.get('saved_as') or result.get('name') or args.file}")
+    if result.get("imported_from"):
+        print(f"  来源: {result['imported_from']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器."""
     parser = argparse.ArgumentParser(
@@ -1450,6 +1735,119 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_tpl_restore_exec.set_defaults(func=cmd_template_restore_execution)
+
+    # --- 批量任务模板 (batch-template-*) ---
+    p_bt_save = subparsers.add_parser(
+        "batch-template-save",
+        help="保存批量任务模板（执行参数、环境变量白名单、导出选项、冲突策略），可新增/修改",
+    )
+    p_bt_save.add_argument("name", help="模板名称（唯一）")
+    p_bt_save.add_argument("-d", "--description", help="模板描述", default=None)
+    p_bt_save.add_argument(
+        "-p", "--params",
+        help="执行参数（JSON 字符串），如 '{\"status\":\"pending\",\"batch_id\":1}'",
+        default=None,
+    )
+    p_bt_save.add_argument(
+        "-e", "--env",
+        help="环境变量白名单（逗号分隔），如 'PYTHONPATH,HOME,AUDIT_DIR'",
+        default=None,
+    )
+    p_bt_save.add_argument(
+        "--export-opts",
+        help="导出选项（JSON 字符串），如 '{\"include_sources\":true,\"encoding\":\"utf-8\"}'",
+        default=None,
+    )
+    p_bt_save.add_argument(
+        "--conflict-default",
+        choices=["abort", "save-as", "overwrite"],
+        default="abort",
+        help="默认冲突策略：abort(中止,默认) / save-as(另存) / overwrite(覆盖)",
+    )
+    p_bt_save.add_argument(
+        "--disabled", action="store_true",
+        help="创建时即标记为禁用（默认启用）",
+    )
+    p_bt_save.set_defaults(func=cmd_bt_save)
+
+    p_bt_list = subparsers.add_parser(
+        "batch-template-list",
+        help="列出批量任务模板",
+    )
+    p_bt_list.add_argument(
+        "-a", "--all", action="store_true",
+        help="显示包括禁用的所有模板（默认只显示启用的）",
+    )
+    p_bt_list.set_defaults(func=cmd_bt_list)
+
+    p_bt_show = subparsers.add_parser(
+        "batch-template-show",
+        help="查看批量任务模板详情",
+    )
+    p_bt_show.add_argument("name", help="模板名称")
+    p_bt_show.set_defaults(func=cmd_bt_show)
+
+    p_bt_delete = subparsers.add_parser(
+        "batch-template-delete",
+        help="删除批量任务模板（可通过 batch-template-undo 撤销）",
+    )
+    p_bt_delete.add_argument("name", help="模板名称")
+    p_bt_delete.set_defaults(func=cmd_bt_delete)
+
+    p_bt_disable = subparsers.add_parser(
+        "batch-template-disable",
+        help="禁用批量任务模板（可 undo）",
+    )
+    p_bt_disable.add_argument("name", help="模板名称")
+    p_bt_disable.set_defaults(func=cmd_bt_disable)
+
+    p_bt_enable = subparsers.add_parser(
+        "batch-template-enable",
+        help="启用批量任务模板（可 undo）",
+    )
+    p_bt_enable.add_argument("name", help="模板名称")
+    p_bt_enable.set_defaults(func=cmd_bt_enable)
+
+    p_bt_copy = subparsers.add_parser(
+        "batch-template-copy",
+        help="复制批量任务模板",
+    )
+    p_bt_copy.add_argument("source", help="源模板名称")
+    p_bt_copy.add_argument("destination", help="目标模板名称（不能已存在）")
+    p_bt_copy.set_defaults(func=cmd_bt_copy)
+
+    p_bt_undo = subparsers.add_parser(
+        "batch-template-undo",
+        help="撤销指定模板的最近一次变更（create/modify/delete/disable/enable）",
+    )
+    p_bt_undo.add_argument("name", help="模板名称")
+    p_bt_undo.set_defaults(func=cmd_bt_undo)
+
+    p_bt_export = subparsers.add_parser(
+        "batch-template-export",
+        help="把批量任务模板导出为 JSON 配置文件（可分享/备份）",
+    )
+    p_bt_export.add_argument("name", help="模板名称")
+    p_bt_export.add_argument("file", help="输出文件路径(JSON)")
+    p_bt_export.set_defaults(func=cmd_bt_export)
+
+    p_bt_import = subparsers.add_parser(
+        "batch-template-import",
+        help="从 JSON 文件导入批量任务模板，支持 --conflict abort|save-as|overwrite",
+    )
+    p_bt_import.add_argument("file", help="模板配置文件路径(JSON)")
+    p_bt_import.add_argument(
+        "--conflict",
+        choices=["abort", "save-as", "overwrite"],
+        default="abort",
+        help=(
+            "重名冲突策略："
+            "abort(中止,默认) — 同名且内容不同时立即中止，不改动任何数据；"
+            "save-as(另存) — 自动另存为 <name>_2, <name>_3 ...；"
+            "overwrite(覆盖) — 直接覆盖已有模板（记录 modify 历史，可 undo）"
+        ),
+    )
+    p_bt_import.set_defaults(func=cmd_bt_import)
 
     return parser
 
